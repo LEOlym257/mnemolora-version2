@@ -43,7 +43,7 @@ This repository contains the AdaJEPA code on top of [temporal-straightening](htt
 
 ## Released Checkpoints and Eval Data
 
-Download the released [checkpoints and data](https://drive.google.com/drive/folders/11IVDIrVDU6W47txR_ku1RkhRUj9F4ybs?usp=sharing) (medium-maze data is hosted [separately](https://drive.google.com/drive/folders/1qbPO9MK7LwX2GBQq-fP_xXoy82wYlkde?usp=drive_link)) and put them in `checkpoints/` and `data/` at the repo root. All released checkpoints include a decoder for visualization (see [Visualization](#visualization)). To train these world models yourself, use the training code in [temporal-straightening](https://github.com/agentic-learning-ai-lab/temporal-straightening).
+Download the released [checkpoints and data](https://drive.google.com/drive/folders/11IVDIrVDU6W47txR_ku1RkhRUj9F4ybs?usp=sharing) (medium-maze data is hosted [separately](https://drive.google.com/drive/folders/1qbPO9MK7LwX2GBQq-fP_xXoy82wYlkde?usp=sharing)) and put them in `checkpoints/` and `data/` at the repo root. All released checkpoints include a decoder for visualization (see [Visualization](#visualization)). To train these world models yourself, use the training code in [temporal-straightening](https://github.com/agentic-learning-ai-lab/temporal-straightening).
 
 ## Evaluation
 
