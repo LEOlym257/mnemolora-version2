@@ -14,8 +14,9 @@
 
 1. [Installation](#installation)
 2. [AdaJEPA](#adajepa)
-3. [Released Checkpoints and Eval Data](#released-checkpoints-and-eval-data)
-4. [Evaluation](#evaluation)
+3. [FD-PSC Test-Time Memory](#fd-psc-test-time-memory)
+4. [Released Checkpoints and Eval Data](#released-checkpoints-and-eval-data)
+5. [Evaluation](#evaluation)
 
 ## Installation
 
@@ -39,6 +40,12 @@ This repository contains the AdaJEPA code on top of [temporal-straightening](htt
 | `planning/image_corruption.py` | Eval-time visual shifts: blur / salt-and-pepper / dark applied to observations in code, plus env-rendered color shifts via `env_kwargs_override` |
 | `env/pointmaze/maze_model.py` | Eval-time dynamics shifts: `density_scale` / `damping_scale` kwargs rebuild the maze MJCF with scaled body density (mass) and joint damping, injected via `env_kwargs_override` |
 | `datasets/diverse_maze_goals.py` | Eval-time layout shifts: BFS distance-controlled (start, goal) sampling on held-out maze layouts, each eval episode built with its own maze |
+
+## FD-PSC Test-Time Memory
+
+This repository also includes the optional FD-PSC continual test-time memory system. It is **disabled by default** in every shipped planning config: with `fd_psc.enabled=false`, AdaJEPA does not inject adapters, register FD-PSC hooks, or add checkpoint keys, so existing AdaJEPA checkpoints and planning behavior remain unchanged.
+
+See the [usage guide](docs/fd_psc.md), [design and state-machine reference](docs/fd_psc_design.md), and [implementation and verification report](docs/fd_psc_implementation_report.md) for configuration, external-data manifests, sidecar checkpoints, experiment commands, test evidence, and explicitly unrun real-resource checks.
 
 
 ## Released Checkpoints and Eval Data

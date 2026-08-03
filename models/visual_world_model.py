@@ -182,6 +182,49 @@ class VWorldModel(nn.Module):
         proprio_emb = self.encode_proprio(proprio)
         return {"visual": visual_embs, "proprio": proprio_emb}
 
+    def extract_frozen_visual_latent(self, obs):
+        """Explicit FD-PSC replay cut, before the post-backbone projector.
+
+        The protocol object is deliberately not an ``nn.Module`` and therefore
+        does not add checkpoint keys. Unsupported encoders fail with an
+        actionable error rather than falling back to a hook-only latent.
+        """
+        from fd_psc.encoder_adapters import get_encoder_adapter
+
+        return get_encoder_adapter(self).extract_frozen_visual_latent(obs)
+
+    def project_visual_latent(self, latent):
+        """Run the post-backbone projection head on a versioned frozen latent."""
+        from fd_psc.encoder_adapters import get_encoder_adapter
+
+        return get_encoder_adapter(self).project_visual_latent(latent)
+
+    def encode_from_frozen_visual_latent(self, latent, proprio, act):
+        """Rebuild the normal JEPA token tensor from the stable replay cut."""
+        visual_embs = self.project_visual_latent(latent)
+        if visual_embs.ndim != 4:
+            raise ValueError(
+                "project_visual_latent must return [batch,time,patch,dim], got "
+                f"{tuple(visual_embs.shape)}"
+            )
+        proprio_emb = self.encode_proprio(proprio)
+        act_emb = self.encode_act(act)
+        if self.concat_dim == 0:
+            return torch.cat(
+                [visual_embs, proprio_emb.unsqueeze(2), act_emb.unsqueeze(2)], dim=2
+            )
+        proprio_tiled = repeat(
+            proprio_emb.unsqueeze(2),
+            "b t 1 a -> b t f a",
+            f=visual_embs.shape[2],
+        ).repeat(1, 1, 1, self.num_proprio_repeat)
+        act_tiled = repeat(
+            act_emb.unsqueeze(2),
+            "b t 1 a -> b t f a",
+            f=visual_embs.shape[2],
+        ).repeat(1, 1, 1, self.num_action_repeat)
+        return torch.cat([visual_embs, proprio_tiled, act_tiled], dim=3)
+
     def predict(self, z):  # in embedding space
         """
         input : z: (b, num_hist, num_patches, emb_dim)

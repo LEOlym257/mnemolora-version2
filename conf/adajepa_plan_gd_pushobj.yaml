@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - fd_psc: disabled
   - override hydra/launcher: submitit_slurm
 
 hydra:
@@ -44,6 +45,7 @@ objective:
 
 planner:
   _target_: planning.adajepa_mpc.AdaJEPAMPCPlanner
+  fd_psc: ${fd_psc}
   max_iter: 20
   n_taken_actions: 5
 

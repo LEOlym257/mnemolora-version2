@@ -11,8 +11,11 @@ def pair(t):
     return t if isinstance(t, tuple) else (t, t)
 
 def generate_mask_matrix(npatch, nwindow):
-    zeros = torch.zeros(npatch, npatch)
-    ones = torch.ones(npatch, npatch)
+    # A non-persistent boolean buffer is device agnostic and keeps old
+    # checkpoints loadable (the historical implementation allocated this
+    # tensor eagerly on CUDA and therefore could not even construct on CPU).
+    zeros = torch.zeros(npatch, npatch, dtype=torch.bool)
+    ones = torch.ones(npatch, npatch, dtype=torch.bool)
     rows = []
     for i in range(nwindow):
         row = torch.cat([ones] * (i+1) + [zeros] * (nwindow - i-1), dim=1)
@@ -55,7 +58,11 @@ class Attention(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
         ) if project_out else nn.Identity()
-        self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')
+        self.register_buffer(
+            "bias",
+            generate_mask_matrix(NUM_PATCHES, NUM_FRAMES),
+            persistent=False,
+        )
 
     def forward(self, x):
         (
@@ -70,7 +77,7 @@ class Attention(nn.Module):
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         # apply causal mask
-        dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        dots = dots.masked_fill(~self.bias[:, :, :T, :T], float("-inf"))
 
         attn = self.attend(dots)
         attn = self.dropout(attn)

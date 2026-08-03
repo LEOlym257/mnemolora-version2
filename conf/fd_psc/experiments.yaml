@@ -1,0 +1,91 @@
+# Named, reproducible comparison overrides.  Every enabled variant uses the
+# same fixed external manifest and target-module discovery; the runner assigns
+# each one an isolated writable sidecar directory.
+variants:
+  frozen_adajepa:
+    fd_config: disabled
+    overrides: [planner.adapt.steps=0]
+  selected_layer_adajepa:
+    fd_config: disabled
+    overrides: []
+  full_depth_episode_reset:
+    fd_config: default
+    overrides: [fd_psc.run_mode=episodic_reset]
+  full_depth_accumulate:
+    fd_config: default
+    overrides: [fd_psc.run_mode=accumulate]
+  episodic_slow_plain_svd:
+    fd_config: default
+    overrides: [fd_psc.run_mode=plain_svd, fd_psc.merge.soft_ness_enabled=false, fd_psc.gates.allow_unsafe_ablation=true]
+  without_soft_ness:
+    fd_config: default
+    overrides: [fd_psc.merge.soft_ness_enabled=false]
+  without_current_history_anchor_gates:
+    fd_config: default
+    overrides: [fd_psc.gates.allow_unsafe_ablation=true, fd_psc.gates.current_gain_enabled=false, fd_psc.gates.history_enabled=false, fd_psc.gates.anchor_enabled=false]
+  without_plasticity_gate:
+    fd_config: default
+    overrides: [fd_psc.gates.allow_unsafe_ablation=true, fd_psc.gates.plasticity_enabled=false]
+  without_triggered_slice:
+    fd_config: default
+    overrides: [fd_psc.slice.enabled=false]
+  slice_exact:
+    fd_config: default
+    overrides: [fd_psc.slice.initialization=slice_exact]
+  slice_symmetric:
+    fd_config: default
+    overrides: [fd_psc.slice.initialization=slice_symmetric]
+  c_pcgrad:
+    fd_config: default
+    overrides: [fd_psc.gradient_geometry.projection_method=c_pcgrad]
+  dual_constraint:
+    fd_config: default
+    overrides: [fd_psc.gradient_geometry.projection_method=dual_constraint]
+  per_step_pcgrad_negative_control:
+    fd_config: default
+    overrides: [fd_psc.gradient_geometry.projection_method=per_step_c_pcgrad, fd_psc.gates.allow_unsafe_ablation=true]
+  sdc_off:
+    fd_config: default
+    overrides: [fd_psc.sdc.enabled=false]
+  sdc_always:
+    fd_config: default
+    overrides: [fd_psc.sdc.event_triggered=false, fd_psc.gates.allow_unsafe_ablation=true]
+  sdc_event_triggered:
+    fd_config: default
+    overrides: [fd_psc.sdc.event_triggered=true]
+  spectral_off:
+    fd_config: default
+    overrides: [fd_psc.spectral_surgery.enabled=false]
+  spectral_output_only:
+    fd_config: default
+    overrides: [fd_psc.spectral_surgery.output_writing_layers_only=true]
+  spectral_all_layers:
+    fd_config: default
+    overrides: [fd_psc.spectral_surgery.output_writing_layers_only=false]
+  replay_uniform:
+    fd_config: default
+    overrides: [fd_psc.replay.repair_sampling=balanced_uniform]
+  replay_grasp:
+    fd_config: default
+    overrides: [fd_psc.replay.repair_sampling=grasp]
+  repair_jepa:
+    fd_config: default
+    overrides: [fd_psc.repair.proximal_enabled=false]
+  repair_jepa_lpr:
+    fd_config: default
+    overrides: [fd_psc.repair.proximal_enabled=true]
+  reject_conflict:
+    fd_config: default
+    overrides: [fd_psc.exception.enabled=false]
+  exception_adapter:
+    fd_config: default
+    overrides: [fd_psc.exception.enabled=true]
+  slow_rank_8:
+    fd_config: default
+    overrides: ["fd_psc.slow_lora.allowed_ranks=[8]", fd_psc.slow_lora.initial_rank=8, fd_psc.slow_lora.maximum_rank=8]
+  slow_rank_16:
+    fd_config: default
+    overrides: ["fd_psc.slow_lora.allowed_ranks=[16]", fd_psc.slow_lora.initial_rank=16, fd_psc.slow_lora.maximum_rank=16]
+  slow_rank_adaptive:
+    fd_config: default
+    overrides: ["fd_psc.slow_lora.allowed_ranks=[8,16,24,32]"]

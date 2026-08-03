@@ -1,4 +1,5 @@
 import os
+import hashlib
 import gym
 import json
 import time
@@ -171,6 +172,50 @@ class PlanWorkspace:
             proprio_std=self.dset.proprio_std,
             transform=self.dset.transform,
         )
+        self.fd_psc_preprocess_payload = None
+        self.fd_psc_preprocess_hash = None
+        fd_psc_cfg = self.cfg_dict.get("fd_psc", {})
+        if isinstance(fd_psc_cfg, dict) and bool(fd_psc_cfg.get("enabled", False)):
+            # Bind fixed external/calibration artifacts to the exact online
+            # normalization and visual transform path.  The manifest generator
+            # consumes this SHA-256 value; FD-PSC refuses startup on mismatch.
+            from fd_psc.preprocess_identity import (
+                compute_preprocess_hash,
+                preprocess_identity_payload,
+            )
+
+            self.fd_psc_preprocess_payload = preprocess_identity_payload(
+                self.data_preprocessor,
+                encoder_transform=getattr(self.wm, "encoder_transform", None),
+                frameskip=self.frameskip,
+                num_hist=int(getattr(self.wm, "num_hist", 1)),
+                num_pred=int(getattr(self.wm, "num_pred", 1)),
+            )
+            self.fd_psc_preprocess_hash = compute_preprocess_hash(
+                self.data_preprocessor,
+                encoder_transform=getattr(self.wm, "encoder_transform", None),
+                frameskip=self.frameskip,
+                num_hist=int(getattr(self.wm, "num_hist", 1)),
+                num_pred=int(getattr(self.wm, "num_pred", 1)),
+            )
+            self.wm._fd_psc_preprocess_hash = self.fd_psc_preprocess_hash
+            preprocess_identity_path = Path(
+                self.cfg_dict.get("saved_folder", ".")
+            ).expanduser().resolve() / "fd_psc_preprocess_identity.json"
+            preprocess_identity_path.parent.mkdir(parents=True, exist_ok=True)
+            preprocess_identity_path.write_text(
+                json.dumps(
+                    {
+                        "preprocess_hash": self.fd_psc_preprocess_hash,
+                        "identity": self.fd_psc_preprocess_payload,
+                    },
+                    sort_keys=True,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                encoding="utf-8",
+            )
 
         if self.cfg_dict["goal_source"] == "file":
             self.prepare_targets_from_file(cfg_dict["goal_file_path"])
@@ -211,6 +256,14 @@ class PlanWorkspace:
             )
         elif "horizon" in planner_cfg:
             planner_cfg["horizon"] = planner_cfg["horizon"] // self.frameskip
+        planner_runtime_kwargs = {}
+        if (
+            self.fd_psc_preprocess_hash is not None
+            and str(planner_cfg.get("_target_", "")).endswith("AdaJEPAMPCPlanner")
+        ):
+            planner_runtime_kwargs["fd_psc_runtime_preprocess_hash"] = (
+                self.fd_psc_preprocess_hash
+            )
         self.planner = hydra.utils.instantiate(
             planner_cfg,
             wm=self.wm,
@@ -221,6 +274,7 @@ class PlanWorkspace:
             evaluator=self.evaluator,
             wandb_run=self.wandb_run,
             log_filename=self.log_filename,
+            **planner_runtime_kwargs,
         )
 
 
@@ -504,6 +558,17 @@ class PlanWorkspace:
         print(f"Dumped plan targets to {file_path}")
 
     def perform_planning(self):
+        # Report-test is owned by the outer workspace only.  Availability is
+        # checked before any episode; theta_0 and final losses are evaluated
+        # after planning and never exposed to candidates, gates, or routing.
+        from fd_psc.experiment_reporting import (
+            begin_report_test,
+            finish_report_test,
+            summarize_metric_events,
+            write_experiment_report,
+        )
+
+        report_test_session = begin_report_test(self.planner, self.eval_seed)
         if self.debug_dset_init:
             actions_init = self.gt_actions
         else:
@@ -528,6 +593,25 @@ class PlanWorkspace:
         }
         with open(self.log_filename, "a") as file:
             file.write(json.dumps(logs_entry) + "\n")
+        report_test = finish_report_test(self.planner, report_test_session)
+        fd_system = getattr(self.planner, "fd_psc_system", None)
+        algorithm_metrics = (
+            summarize_metric_events(fd_system.metrics.events())
+            if fd_system is not None
+            else {}
+        )
+        metric_artifacts = {}
+        for name in ("fd_psc_metrics.jsonl", "fd_psc_metrics.csv", "per_iter_logs.json"):
+            path = Path(self.cfg_dict["saved_folder"]) / name
+            if path.is_file():
+                metric_artifacts[name] = str(path.resolve())
+        write_experiment_report(
+            Path(self.cfg_dict["saved_folder"]),
+            planning_metrics=logs_entry,
+            report_test=report_test,
+            algorithm_metrics=algorithm_metrics,
+            metric_artifacts=metric_artifacts,
+        )
         return logs
 
 
@@ -598,6 +682,17 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
         num_proprio_repeat=train_cfg.num_proprio_repeat,
     )
     model.to(device)
+    # FD-PSC treats the official AdaJEPA checkpoint as immutable theta_0 and
+    # binds every sidecar/external manifest to its exact file content.  These
+    # plain attributes are metadata (not tensors/modules) and do not affect the
+    # state_dict or disabled-path outputs.
+    if model_ckpt.exists():
+        digest = hashlib.sha256()
+        with model_ckpt.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        model._base_checkpoint_path = str(model_ckpt.resolve())
+        model._base_checkpoint_hash = digest.hexdigest()
     return model
 
 

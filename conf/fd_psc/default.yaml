@@ -1,0 +1,217 @@
+enabled: true
+seed: ${seed}
+run_mode: fd_psc
+
+target_modules:
+  predictor_linear: true
+  post_backbone_projection_linear: true
+  action_encoder_linear: false
+  proprio_encoder_linear: false
+  exclude_frozen_backbone: true
+  require_active_forward_path: true
+  fail_on_empty_predictor_targets: true
+  fail_on_empty_projection_targets: false
+  require_projection_targets_if_head_exists: true
+
+episodic_lora:
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  pilot_enabled: true
+  a_initialization: kaiming_uniform
+  b_initialization: zeros
+
+conv_lora:
+  enabled: true
+  target_scope: post_backbone_projection_head
+  parameterization: flattened_kernel
+  groups_mode: groupwise
+
+slow_lora:
+  initial_rank: 8
+  allowed_ranks: [8, 16, 24, 32]
+  maximum_rank: 32
+  spectral_energy_threshold: 0.99
+  functional_error_threshold: 0.02
+
+gradient_geometry:
+  enabled: true
+  ema_beta: 0.8
+  conflict_threshold: -0.1
+  minimum_transitions: 3
+  consecutive_conflicts: 2
+  current_batches: 2
+  history_batches: 2
+  anchor_batches: 1
+  windows_per_batch: 8
+  projection_method: dual_constraint
+  projection_scope: per_logical_layer
+  global_cosine_weighting: gradient_norm
+  hook_normalization: exact_loss_gradient
+  epsilon: 1.0e-8
+  c_pcgrad_coefficient: 1.0
+  history_slack: 0.0
+  anchor_slack: 0.0
+
+slice:
+  enabled: true
+  trigger_only: true
+  initialization: slice_exact
+  fallback_initialization: slice_symmetric
+  rank: 8
+  randomized_svd_oversampling: 2
+  power_iterations: 1
+  magnitude_mode: first_step_match
+  maximum_scale: 10.0
+
+sdc:
+  enabled: true
+  event_triggered: true
+  check_every_replans: 4
+  base_energy_threshold: 0.9
+  drift_threshold: 0.25
+  drift_consecutive_checks: 2
+  drift_increase_tolerance: 0.01
+  minimum_gamma: 0.1
+  anchor_regression_trigger: 0.0
+
+spectral_surgery:
+  enabled: true
+  output_writing_layers_only: true
+  steps: 2
+  learning_rate: 0.1
+  minimum_scale: 0.75
+  maximum_scale: 1.25
+  preserve_spectral_l2_norm: true
+  current_weight: 1.0
+  history_weight: 1.0
+  anchor_weight: 1.0
+
+activation_subspace:
+  enabled: true
+  maximum_rank: 64
+  spectral_energy_threshold: 0.99
+  forgetting_factor: 0.99
+  soft_ness_tau_mode: median
+  soft_ness_tau_fixed: null
+  soft_ness_tau_quantile: 0.5
+  minimum_energy: 1.0e-8
+
+merge:
+  soft_ness_enabled: true
+  shared_coefficients: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+  safe_coefficients: [0.5, 0.75, 1.0]
+  use_context_similarity: true
+  use_gradient_similarity: true
+  use_residual_similarity: true
+  context_conflict_threshold: null
+  context_match_threshold: null
+  gradient_conflict_threshold: -0.1
+  gradient_match_threshold: 0.1
+  residual_match_threshold: null
+  selection_policy: calibration_lexicographic
+
+replay:
+  historical_windows: 512
+  visual_latent_dtype: float16
+  auxiliary_dtype: float32
+  compression: none
+  sampling: balanced_uniform
+  repair_sampling: grasp
+  maximum_context_clusters: 32
+  new_cluster_similarity_threshold: 0.8
+  minimum_windows_per_cluster: 4
+
+external_eval_data:
+  source: fixed_manifest
+  manifest_path: null
+  calibration_path: null
+  commit_query_path: null
+  plasticity_support_path: null
+  plasticity_query_path: null
+  report_test_path: null
+  representation: frozen_backbone_latent
+  context_key: context_identifier
+  context_source: episode_metadata
+  split_unit: trajectory
+  require_context_match: true
+  verify_checksums: true
+  missing_context_policy: error
+  commit_query_policy: single_final_proposal
+
+anchor_data:
+  source: fixed_manifest
+  manifest_path: null
+  data_path: null
+  windows: 128
+  verify_checksums: true
+  missing_policy: error
+
+repair:
+  enabled: true
+  maximum_steps: 20
+  candidate_steps: [5, 10, 20]
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  windows_per_batch: 8
+  current_weight: 1.0
+  replay_weight: 1.0
+  proximal_enabled: true
+  proximal_weight: 1.0
+  pcgrad_enabled: true
+  checkpoint_schedule: cumulative
+  proximal_layer_tags: [encoder_projection, attention_output, mlp_output, final_projection]
+
+exception:
+  enabled: true
+  maximum_adapters: 8
+  routing: nearest_prototype
+  minimum_route_similarity: 0.5
+  no_match_behavior: slow_only
+  minimum_calibration_fast_gain: 0.0
+  minimum_commit_fast_gain: 0.0
+  maximum_rank: 32
+  local_replay_windows: 64
+  routed_episode_update: replace_exception
+  eviction_policy: least_recently_used_then_lowest_gain
+  merge_similar_adapters: false
+
+gates:
+  allow_unsafe_ablation: false
+  current_gain_enabled: true
+  history_enabled: true
+  anchor_enabled: true
+  plasticity_enabled: true
+  functional_error_enabled: true
+  spectral_drift_enabled: true
+  fast_gain_retention: 0.8
+  history_loss_tolerance: 0.0
+  anchor_loss_tolerance: 0.0
+  worst_context_loss_tolerance: 0.0
+  plasticity_retention: 0.9
+  drift_tolerance: 0.05
+  absolute_numerical_tolerance: 1.0e-6
+  relative_numerical_tolerance: 1.0e-5
+
+canary:
+  enabled: false
+  every_episodes: 10
+  rollout_count: 4
+  manifest_path: null
+  high_risk_rank_expansion: true
+  unavailable_policy: report_unrun
+
+checkpoint:
+  enabled: true
+  state_directory: fd_psc_state
+  latest_pointer_path: fd_psc_state_latest.json
+  resume_path: null
+  save_every_episodes: 1
+  retention_versions: 20
+  keep_commit_journal: true
+  atomic_write: true
+
+logging:
+  per_layer_metrics: true
+  save_candidate_reports: true
+  save_gradient_statistics: true

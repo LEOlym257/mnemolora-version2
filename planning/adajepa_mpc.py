@@ -21,7 +21,17 @@ from .mpc import MPCPlanner, _cuda_sync
 
 
 class AdaJEPAMPCPlanner(MPCPlanner):
-    def __init__(self, adapt=None, **kwargs):
+    def __init__(
+        self,
+        adapt=None,
+        fd_psc=None,
+        fd_psc_runtime_preprocess_hash=None,
+        fd_psc_canary_evaluator=None,
+        **kwargs,
+    ):
+        runtime_output_dir = os.path.abspath(
+            os.path.dirname(kwargs.get("log_filename") or ".") or "."
+        )
         super().__init__(**kwargs)
         adapt = dict(adapt) if adapt else {}
         self.adajepa_finetune_every = adapt.get("finetune_every", 1)
@@ -35,7 +45,12 @@ class AdaJEPAMPCPlanner(MPCPlanner):
             last_layer_only=adapt.get("last_layer_only", True),
             encoder_lr=adapt.get("encoder_lr", None),
             encoder_last_layer_only=adapt.get("encoder_last_layer_only", True),
+            fd_psc=fd_psc,
+            runtime_output_dir=runtime_output_dir,
+            fd_psc_canary_evaluator=fd_psc_canary_evaluator,
+            fd_psc_runtime_preprocess_hash=fd_psc_runtime_preprocess_hash,
         )
+        self.fd_psc_system = self.adajepa_trainer.fd_psc_system
         self._adajepa_loss_records = []
         self._records = []
         self._sample_idx = 0
@@ -61,23 +76,83 @@ class AdaJEPAMPCPlanner(MPCPlanner):
         self._records = []
 
         for i in range(n_evals):
-            self.adajepa_trainer.reset()
             self._sample_idx = i
             self._obs_buffer, self._act_buffer, self._segment_scores = [], [], []
             self.plan_suffix = f"_s{i}"
-            actions_i, action_len_i = self._plan_single(
-                obs_0_i={k: v[i : i + 1] for k, v in obs_0.items()},
-                obs_g_i={k: v[i : i + 1] for k, v in obs_g.items()},
-                env_i=_EnvWorkerProxy(self.env, i),
-                seed_i=[self.evaluator.seed[i]],
-                state_0_i=self.evaluator.state_0[i : i + 1],
-                state_g_i=self.evaluator.state_g[i : i + 1],
-            )
+            obs_0_i = {k: v[i : i + 1] for k, v in obs_0.items()}
+            obs_g_i = {k: v[i : i + 1] for k, v in obs_g.items()}
+            if self.fd_psc_system is None:
+                self.adajepa_trainer.reset()
+            else:
+                metadata = {
+                    "sample_idx": int(i),
+                    "seed": int(self.evaluator.seed[i]),
+                }
+                # A dataset/environment may expose the task context alongside
+                # the fixed evaluation sample.  This is explicit episode-start
+                # metadata, not an inference from calibration membership.
+                context_values = getattr(
+                    self.evaluator,
+                    "context_identifiers",
+                    getattr(self.evaluator, "context_identifier", None),
+                )
+                if context_values is not None:
+                    if isinstance(context_values, str):
+                        metadata["context_identifier"] = context_values
+                    else:
+                        metadata["context_identifier"] = str(context_values[i])
+                context_identifier = self.fd_psc_system.resolve_context_identifier(metadata)
+                self.adajepa_trainer.begin_fd_psc_episode(
+                    episode_id=self.fd_psc_system.next_episode_id,
+                    context_identifier=context_identifier,
+                    initial_obs=obs_0_i,
+                    metadata=metadata,
+                )
+            try:
+                actions_i, action_len_i = self._plan_single(
+                    obs_0_i=obs_0_i,
+                    obs_g_i=obs_g_i,
+                    env_i=_EnvWorkerProxy(self.env, i),
+                    seed_i=[self.evaluator.seed[i]],
+                    state_0_i=self.evaluator.state_0[i : i + 1],
+                    state_g_i=self.evaluator.state_g[i : i + 1],
+                )
+                if self.fd_psc_system is not None:
+                    if self._obs_buffer and self._act_buffer:
+                        sleep_report = self.adajepa_trainer.end_fd_psc_episode(
+                            self._obs_buffer,
+                            self._act_buffer,
+                        )
+                        self._records.append(
+                            {
+                                "sample_idx": int(i),
+                                "step": int(self.iter),
+                                "success": bool(self.is_success[0]) if self.is_success is not None else False,
+                                "t_plan_s": 0.0,
+                                "event": "fd_psc_sleep",
+                                **sleep_report,
+                            }
+                        )
+                    else:
+                        self.fd_psc_system.finish_episode_without_sleep("empty_planner_buffer")
+            except BaseException as exc:
+                if self.fd_psc_system is not None:
+                    self.adajepa_trainer.abort_fd_psc_episode(
+                        f"_plan_single failed: {type(exc).__name__}: {exc}"
+                    )
+                raise
+            finally:
+                if self.fd_psc_system is not None:
+                    self.fd_psc_system.reset_episode()
+                    self._obs_buffer, self._act_buffer, self._segment_scores = [], [], []
             all_actions.append(actions_i)
             all_action_lens.append(action_len_i)
 
         self.plan_suffix = ""
-        self.adajepa_trainer.reset()
+        if self.fd_psc_system is None:
+            self.adajepa_trainer.reset()
+        else:
+            self.fd_psc_system.reset_episode()
         self._dump_per_iter_logs(self._records, n_evals)
         self._dump_adajepa_loss_csv()
 
@@ -126,6 +201,14 @@ class AdaJEPAMPCPlanner(MPCPlanner):
     def _post_env_feedback(self, taken_actions, e_obses):
         """Adapt the world model on the newly executed segment (MPC-loop hook)."""
         obs_seq, act_seq = self._extract_adajepa_data(e_obses, taken_actions, self.iter)
+        if self.fd_psc_system is not None:
+            # The incremental identity/checksum audit happens before this
+            # segment can participate in the first online update.
+            self.fd_psc_system.register_support_segment(
+                obs_seq,
+                act_seq,
+                iteration=int(self.iter),
+            )
         self._obs_buffer.append(obs_seq)
         self._act_buffer.append(act_seq)
         self._segment_scores = self._trim_buffer(
@@ -149,6 +232,8 @@ class AdaJEPAMPCPlanner(MPCPlanner):
             rec["adajepa/pred_loss"] = pred_loss
             self._record_adajepa_losses(self._sample_idx, self.iter + 1, step_losses)
             extra_logs = {"adajepa/pred_loss": pred_loss}
+            if self.fd_psc_system is not None:
+                extra_logs.update(self.fd_psc_system.online_metrics())
         self._records.append(rec)
         return extra_logs
 
