@@ -316,7 +316,26 @@ def _generator(device: torch.device, seed: int) -> torch.Generator:
 
 
 def _tensor_bytes(tensor: Tensor) -> bytes:
-    return tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    # A CUDA convolution may retain an elementwise-contiguous layout whose
+    # trailing singleton dimensions have strides greater than one (for
+    # example ``(2, 1, 2, 2)`` for a ``[2, 2, 1, 1]`` kernel).  PyTorch's
+    # dtype-view requires the final stride to be exactly one even though that
+    # layout is otherwise contiguous.  Flatten first so byte reinterpretation
+    # is valid on both CPU and CUDA without weakening the bitwise invariant.
+    return (
+        tensor.detach()
+        .contiguous()
+        .reshape(-1)
+        .contiguous()
+        .view(torch.uint8)
+        .cpu()
+        .numpy()
+        .tobytes()
+    )
+
+
+def _tensor_byte_view(tensor: Tensor) -> Tensor:
+    return tensor.detach().contiguous().reshape(-1).contiguous().view(torch.uint8)
 
 
 def _hash_tensor_tree(value: Any) -> str:
@@ -671,8 +690,8 @@ class FDPSCSystem:
             if current.shape != item.value.shape or current.dtype != item.value.dtype:
                 changed.append(item.name)
             elif not torch.equal(
-                current.contiguous().view(torch.uint8),
-                item.value.to(device=current.device).contiguous().view(torch.uint8),
+                _tensor_byte_view(current),
+                _tensor_byte_view(item.value.to(device=current.device)),
             ):
                 changed.append(item.name)
             if item.is_parameter and bool(getattr(item.tensor, "requires_grad", False)):

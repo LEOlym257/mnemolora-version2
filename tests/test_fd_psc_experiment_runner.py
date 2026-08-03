@@ -14,11 +14,13 @@ import torch
 from fd_psc.experiment_reporting import (
     ReportTestRequiredError,
     begin_report_test,
+    build_required_metric_contract,
     finish_report_test,
     summarize_metric_events,
     write_experiment_report,
 )
 from fd_psc.external_data import ExternalDataError
+from fd_psc.metrics import REQUIRED_METRIC_NAMES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -308,22 +310,138 @@ class ReportLifecycleTests(unittest.TestCase):
                 report_test={"status": "not_applicable", "aggregate": None},
             )
             self.assertEqual(report["planning_metrics"]["success"], 1.0)
+            self.assertEqual(
+                set(report["metric_contract"]["metrics"]),
+                REQUIRED_METRIC_NAMES,
+            )
+            self.assertEqual(
+                report["metric_contract"]["classified_metric_count"],
+                len(REQUIRED_METRIC_NAMES),
+            )
+            self.assertEqual(
+                report["metric_contract"]["metrics"]["planning_success"],
+                {
+                    "status": "available",
+                    "value": 1.0,
+                    "reason": None,
+                    "source": "planning_metrics",
+                },
+            )
+            self.assertEqual(
+                report["metric_contract"]["metrics"]["report_test_gain"][
+                    "status"
+                ],
+                "not_applicable",
+            )
+            self.assertEqual(
+                report["metric_contract"]["metrics"]["slow_rank"]["value"],
+                None,
+            )
+            self.assertIn(
+                "not emitted",
+                report["metric_contract"]["metrics"]["slow_rank"]["reason"],
+            )
             self.assertTrue((Path(directory) / "fd_psc_experiment_report.json").is_file())
             self.assertTrue((Path(directory) / "fd_psc_experiment_report.csv").is_file())
 
+            with (Path(directory) / "fd_psc_experiment_report.csv").open(
+                newline="", encoding="utf-8"
+            ) as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["required_metric_coverage_status"], "partial")
+            self.assertGreater(int(row["required_metric_unavailable_count"]), 0)
+            self.assertEqual(
+                set(json.loads(row["required_metric_contract_json"])["metrics"]),
+                REQUIRED_METRIC_NAMES,
+            )
+
     def test_metric_summary_keeps_global_and_context_statistics(self):
         events = [
-            SimpleNamespace(name="commit_query_gain", value=0.25, context_identifier="a"),
-            SimpleNamespace(name="commit_query_gain", value=0.75, context_identifier="b"),
-            SimpleNamespace(name="episode_terminal", value="COMMIT_SLOW", context_identifier="b"),
+            SimpleNamespace(
+                name="commit_query_gain",
+                value=0.25,
+                context_identifier="a",
+                tags={"status": "available"},
+            ),
+            SimpleNamespace(
+                name="commit_query_gain",
+                value=0.75,
+                context_identifier="b",
+                tags={"status": "available"},
+            ),
+            SimpleNamespace(
+                name="episode_terminal",
+                value="COMMIT_SLOW",
+                context_identifier="b",
+                tags={},
+            ),
         ]
         summary = summarize_metric_events(events)
         self.assertEqual(summary["event_count"], 3)
         self.assertEqual(summary["by_name"]["commit_query_gain"]["mean"], 0.5)
         self.assertEqual(
+            summary["by_name"]["commit_query_gain"]["status_counts"],
+            {"available": 2},
+        )
+        self.assertEqual(
             summary["by_context"]["b"]["episode_terminal"]["last"],
             "COMMIT_SLOW",
         )
+
+    def test_required_metric_contract_preserves_nullable_status_and_sources(self):
+        contract = build_required_metric_contract(
+            planning_metrics={"final_eval/success_rate": 0.625},
+            report_test={
+                "status": "evaluated",
+                "aggregate": {"report_test_gain": 0.125},
+            },
+            algorithm_metrics={
+                "by_name": {
+                    "current_jepa_loss": {
+                        "last": 1.5,
+                        "mean": 1.25,
+                        "last_status": "available",
+                        "last_reason": None,
+                    },
+                    "anchor_loss": {
+                        "last": None,
+                        "last_status": "not_applicable",
+                        "last_reason": "cold start",
+                    },
+                    "historical_replay_loss": {
+                        "last": None,
+                        "last_status": "insufficient_observations",
+                        "last_reason": "one committed context",
+                    },
+                }
+            },
+        )
+        self.assertEqual(set(contract["metrics"]), REQUIRED_METRIC_NAMES)
+        self.assertEqual(
+            contract["metrics"]["current_jepa_loss"]["value"], 1.25
+        )
+        self.assertEqual(
+            contract["metrics"]["anchor_loss"],
+            {
+                "status": "not_applicable",
+                "value": None,
+                "reason": "cold start",
+                "source": "algorithm_metrics",
+            },
+        )
+        self.assertEqual(
+            contract["metrics"]["planning_success"]["source"],
+            "planning_metrics",
+        )
+        self.assertEqual(
+            contract["metrics"]["report_test_gain"]["source"],
+            "report_test",
+        )
+        self.assertEqual(contract["coverage_status"], "partial")
+        self.assertEqual(
+            contract["status_counts"]["insufficient_observations"], 1
+        )
+        self.assertEqual(contract["observed_or_not_applicable_count"], 4)
 
 
 if __name__ == "__main__":

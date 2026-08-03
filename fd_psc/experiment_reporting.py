@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from .external_data import ExternalDataError
+from .metrics import METRIC_STATUSES, REQUIRED_METRIC_NAMES
 
 
 class ReportTestRequiredError(RuntimeError):
@@ -59,16 +60,31 @@ def summarize_metric_events(events: Sequence[Any]) -> Dict[str, Any]:
     """Compact the full JSONL event stream for the single-row run report."""
 
     grouped: Dict[str, list[Any]] = {}
+    grouped_statuses: Dict[str, list[Tuple[str, Optional[str]]]] = {}
     by_context: Dict[str, Dict[str, list[Any]]] = {}
     for event in events:
         name = str(event.name)
         value = _json_safe(event.value)
         grouped.setdefault(name, []).append(value)
+        tags = dict(getattr(event, "tags", {}) or {})
+        status = tags.get("status")
+        if status is None:
+            status = "available" if value is not None else "unavailable"
+        if status not in METRIC_STATUSES:
+            raise ReportTestRequiredError(
+                f"metric {name!r} has unsupported availability status {status!r}"
+            )
+        grouped_statuses.setdefault(name, []).append(
+            (str(status), None if tags.get("reason") is None else str(tags["reason"]))
+        )
         context = getattr(event, "context_identifier", None)
         if context is not None:
             by_context.setdefault(str(context), {}).setdefault(name, []).append(value)
 
-    def compact(values: Sequence[Any]) -> Dict[str, Any]:
+    def compact(
+        values: Sequence[Any],
+        statuses: Optional[Sequence[Tuple[str, Optional[str]]]] = None,
+    ) -> Dict[str, Any]:
         result: Dict[str, Any] = {"count": len(values), "last": values[-1]}
         if values and all(
             isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -82,12 +98,20 @@ def summarize_metric_events(events: Sequence[Any]) -> Dict[str, Any]:
                     "maximum": max(numbers),
                 }
             )
+        if statuses:
+            result["last_status"] = statuses[-1][0]
+            result["last_reason"] = statuses[-1][1]
+            result["status_counts"] = {
+                status: sum(1 for item, _reason in statuses if item == status)
+                for status in sorted({item for item, _reason in statuses})
+            }
         return result
 
     return {
         "event_count": sum(len(values) for values in grouped.values()),
         "by_name": {
-            name: compact(values) for name, values in sorted(grouped.items())
+            name: compact(values, grouped_statuses[name])
+            for name, values in sorted(grouped.items())
         },
         "by_context": {
             context: {
@@ -95,6 +119,115 @@ def summarize_metric_events(events: Sequence[Any]) -> Dict[str, Any]:
             }
             for context, metrics in sorted(by_context.items())
         },
+    }
+
+
+def _planning_success(planning_metrics: Mapping[str, Any]) -> Any:
+    for key, value in planning_metrics.items():
+        if str(key).endswith("/success") or str(key).endswith("/success_rate"):
+            return value
+    for key in ("planning_success", "success", "success_rate"):
+        if key in planning_metrics:
+            return planning_metrics[key]
+    return None
+
+
+def build_required_metric_contract(
+    *,
+    planning_metrics: Mapping[str, Any],
+    report_test: Mapping[str, Any],
+    algorithm_metrics: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Classify every V2 section-28 metric without fabricating observations."""
+
+    by_name = dict(algorithm_metrics.get("by_name", {}) or {})
+    entries: Dict[str, Dict[str, Any]] = {}
+    for name in sorted(REQUIRED_METRIC_NAMES):
+        summary = by_name.get(name)
+        if isinstance(summary, Mapping):
+            status = str(
+                summary.get(
+                    "last_status",
+                    "available" if summary.get("last") is not None else "unavailable",
+                )
+            )
+            if status not in METRIC_STATUSES:
+                raise ReportTestRequiredError(
+                    f"metric {name!r} has unsupported availability status {status!r}"
+                )
+            entries[name] = {
+                "status": status,
+                "value": summary.get("mean", summary.get("last"))
+                if status == "available"
+                else None,
+                "reason": summary.get("last_reason"),
+                "source": "algorithm_metrics",
+            }
+            continue
+
+        if name == "planning_success":
+            value = _planning_success(planning_metrics)
+            if value is not None:
+                entries[name] = {
+                    "status": "available",
+                    "value": value,
+                    "reason": None,
+                    "source": "planning_metrics",
+                }
+                continue
+
+        if name == "report_test_gain":
+            aggregate = report_test.get("aggregate") or {}
+            value = aggregate.get("report_test_gain")
+            if value is not None:
+                entries[name] = {
+                    "status": "available",
+                    "value": value,
+                    "reason": None,
+                    "source": "report_test",
+                }
+                continue
+            report_status = str(report_test.get("status", "unavailable"))
+            status = (
+                report_status
+                if report_status in METRIC_STATUSES
+                else "unavailable"
+            )
+            entries[name] = {
+                "status": status,
+                "value": None,
+                "reason": report_test.get("reason")
+                or "report-test aggregate was not evaluated",
+                "source": "report_test",
+            }
+            continue
+
+        entries[name] = {
+            "status": "unavailable",
+            "value": None,
+            "reason": "metric was not emitted by this run",
+            "source": "required_metric_contract",
+        }
+
+    status_counts = {
+        status: sum(1 for entry in entries.values() if entry["status"] == status)
+        for status in sorted(METRIC_STATUSES)
+    }
+    observed_count = (
+        status_counts["available"] + status_counts["not_applicable"]
+    )
+    return {
+        "schema_version": 1,
+        "required_metric_count": len(REQUIRED_METRIC_NAMES),
+        "classified_metric_count": len(entries),
+        "observed_or_not_applicable_count": observed_count,
+        "coverage_status": (
+            "complete"
+            if observed_count == len(REQUIRED_METRIC_NAMES)
+            else "partial"
+        ),
+        "status_counts": status_counts,
+        "metrics": entries,
     }
 
 
@@ -395,14 +528,23 @@ def write_experiment_report(
 
     target = Path(output_dir).expanduser().resolve()
     target.mkdir(parents=True, exist_ok=True)
+    safe_planning_metrics = _json_safe(planning_metrics)
+    safe_algorithm_metrics = _json_safe(algorithm_metrics or {})
+    safe_report_test = _json_safe(report_test)
+    metric_contract = build_required_metric_contract(
+        planning_metrics=safe_planning_metrics,
+        report_test=safe_report_test,
+        algorithm_metrics=safe_algorithm_metrics,
+    )
     report = {
         "schema_version": 1,
         "protocol": "FD-PSC-V2",
         "status": "completed",
-        "planning_metrics": _json_safe(planning_metrics),
-        "algorithm_metrics": _json_safe(algorithm_metrics or {}),
+        "planning_metrics": safe_planning_metrics,
+        "algorithm_metrics": safe_algorithm_metrics,
         "metric_artifacts": _json_safe(metric_artifacts or {}),
-        "report_test": _json_safe(report_test),
+        "metric_contract": metric_contract,
+        "report_test": safe_report_test,
     }
     (target / "fd_psc_experiment_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
@@ -427,13 +569,16 @@ def write_experiment_report(
         "external_calibration_gain": metric_mean("external_calibration_gain"),
         "commit_query_gain": metric_mean("commit_query_gain"),
         "current_jepa_loss": metric_mean("current_jepa_loss"),
-        "planning_success": next(
-            (
-                value
-                for key, value in report["planning_metrics"].items()
-                if str(key).endswith("/success") or str(key).endswith("/success_rate")
-            ),
-            None,
+        "planning_success": _planning_success(report["planning_metrics"]),
+        "required_metric_coverage_status": metric_contract["coverage_status"],
+        "required_metric_available_count": metric_contract["status_counts"][
+            "available"
+        ],
+        "required_metric_unavailable_count": metric_contract["status_counts"][
+            "unavailable"
+        ],
+        "required_metric_contract_json": json.dumps(
+            metric_contract, sort_keys=True, allow_nan=False
         ),
         "planning_metrics_json": json.dumps(
             report["planning_metrics"], sort_keys=True, allow_nan=False
@@ -452,6 +597,7 @@ __all__ = [
     "ReportTestRequiredError",
     "ReportTestSession",
     "begin_report_test",
+    "build_required_metric_contract",
     "finish_report_test",
     "summarize_metric_events",
     "write_experiment_report",

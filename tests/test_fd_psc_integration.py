@@ -426,6 +426,37 @@ class FDPSCIntegrationTests(unittest.TestCase):
             if isinstance(tensor, nn.Parameter):
                 self.assertFalse(tensor.requires_grad)
 
+    def test_base_frozen_audit_handles_contiguous_singleton_strides_bitwise(self):
+        _, trainer, theta0 = self._trainer(learning_rate=0.25)
+        system = trainer.fd_psc_system
+        item = next(
+            value
+            for value in system._base_tensors
+            if value.tensor.ndim == 4 and tuple(value.tensor.shape[-2:]) == (1, 1)
+        )
+        original = item.tensor.detach().clone()
+        # This is a legal contiguous layout because both trailing dimensions
+        # are singletons, but direct float32->uint8 view rejects stride(-1)=2.
+        strided = torch.empty_strided(
+            item.tensor.shape,
+            (2, 1, 2, 2),
+            dtype=item.tensor.dtype,
+            device=item.tensor.device,
+        )
+        strided.copy_(original)
+        item.tensor.data = strided
+        self.assertTrue(item.tensor.is_contiguous())
+        self.assertEqual(item.tensor.stride(-1), 2)
+        system.assert_base_frozen()
+
+        with torch.no_grad():
+            item.tensor.reshape(-1)[0].add_(1.0)
+        with self.assertRaisesRegex(FDPSCIntegrationError, "theta_0 invariant failed"):
+            system.assert_base_frozen()
+        item.tensor.data.copy_(original)
+        system.assert_base_frozen()
+        self.assertTheta0Bitwise(theta0)
+
     def _install_zero_exception(self, system, obs) -> str:
         descriptor = system._context_descriptor(obs, "ctx")
         self.assertIsNotNone(descriptor)
@@ -1098,9 +1129,46 @@ class FDPSCIntegrationTests(unittest.TestCase):
         self.assertEqual(report["commit_query_access_count"], 0)
         self.assertEqual(report["candidate_count"], 0)
         self.assertIn("REJECT_NO_PROPOSAL", report["fd_psc_outcome"])
+        self.assertTrue(
+            any(
+                transition.reason == "zero_episodic_task_vector"
+                for transition in system.state_machine.transition_log
+            )
+        )
         self.assertEqual(system.state_machine.state, FDPSCState.IDLE)
         self.assertTheta0Bitwise(theta0)
         self.assertTrue(model.training is False or not model.training)
+
+    def test_insufficient_support_after_real_update_never_opens_query(self):
+        _, trainer, theta0 = self._trainer(learning_rate=0.25)
+        system = trainer.fd_psc_system
+        # One real replan/update is shorter than the configured three-action
+        # replay horizon.  The online update remains valid, but sleep must not
+        # fabricate frames or open commit-query.
+        system.wm.num_hist = 3
+        obs, actions = _support_segment()
+        episode_id = system.next_episode_id
+        trainer.begin_fd_psc_episode(episode_id, "ctx", initial_obs=obs)
+        system.register_support_segment(obs, actions, iteration=0)
+        losses = trainer.finetune([obs], [actions])
+        self.assertEqual(len(losses), 1)
+        self.assertEqual(system.state_machine.online_update_count, 1)
+        self.assertEqual(system._eligible_replay_segments(), ())
+
+        report = trainer.end_fd_psc_episode([obs], [actions])
+        self.assertEqual(report["fd_psc_outcome"], FDPSCState.REJECT_NO_PROPOSAL.value)
+        self.assertEqual(report["candidate_count"], 0)
+        self.assertEqual(report["commit_query_access_count"], 0)
+        self.assertEqual(system.external.commit_query_access_count(episode_id), 0)
+        self.assertTrue(
+            any(
+                transition.reason
+                == "support_window_shorter_than_num_hist_plus_num_pred"
+                for transition in system.state_machine.transition_log
+            )
+        )
+        self.assertEqual(system.state_machine.state, FDPSCState.IDLE)
+        self.assertTheta0Bitwise(theta0)
 
     def test_preserve_runtime_keeps_optimizer_parameters_live_and_trainable(self):
         model, trainer, theta0 = self._trainer(learning_rate=0.1)
@@ -1451,6 +1519,151 @@ class FDPSCIntegrationTests(unittest.TestCase):
             system.external.issue_commit_query_token(episode_id, "second-proposal")
         self.assertTheta0Bitwise(theta0)
 
+    def test_multiple_candidates_commit_query_gate_failure_is_terminal(self):
+        _, trainer, theta0 = self._trainer(
+            learning_rate=0.25,
+            steps=3,
+            config_overrides={
+                "gates": {
+                    "allow_unsafe_ablation": True,
+                    "current_gain_enabled": True,
+                },
+                "merge": {
+                    "soft_ness_enabled": True,
+                    "shared_coefficients": [0.0, 1.0],
+                    "safe_coefficients": [0.5, 1.0],
+                    "use_context_similarity": False,
+                    "use_gradient_similarity": False,
+                    "use_residual_similarity": False,
+                }
+            },
+        )
+        system = trainer.fd_psc_system
+        episode_id = system.next_episode_id
+        obs, actions = _support_segment()
+        trainer.begin_fd_psc_episode(episode_id, "ctx", initial_obs=obs)
+        system.register_support_segment(obs, actions, iteration=0)
+        trainer.finetune([obs], [actions])
+        slow_before = {
+            logical_id: (
+                adapter.get_slow_factors().B.detach().clone(),
+                adapter.get_slow_factors().A.detach().clone(),
+            )
+            for logical_id, adapter in system.injection.adapters.items()
+        }
+        replay_before = copy.deepcopy(system.replay.state_dict())
+        subspaces_before = copy.deepcopy(system.subspaces.state_dict())
+        router_before = copy.deepcopy(system.exception_router.state_dict())
+        router_before["active_episode_id"] = None
+        router_before["active_route"] = None
+        commit_sequence_before = system._commit_sequence
+        slow_commit_count_before = system._successful_slow_commit_count
+        original_evaluate = system._evaluate_state
+
+        def fail_current_gain_only_on_commit_query(
+            trainer_arg,
+            records,
+            *,
+            state,
+            candidate=None,
+        ):
+            split = records[0].split_name if records else None
+            if split == "commit_query":
+                return {
+                    "before": 1.0,
+                    "fast": 0.5,
+                    "candidate": 2.0,
+                }[state]
+            return original_evaluate(
+                trainer_arg,
+                records,
+                state=state,
+                candidate=candidate,
+            )
+
+        with mock.patch.object(
+            system,
+            "_evaluate_state",
+            side_effect=fail_current_gain_only_on_commit_query,
+        ), mock.patch.object(
+            system,
+            "_commit_candidate",
+            wraps=system._commit_candidate,
+        ) as commit_candidate:
+            report = trainer.end_fd_psc_episode([obs], [actions])
+
+        self.assertGreater(report["candidate_count"], 1)
+        self.assertEqual(report["proposal_type"], ProposalType.GLOBAL_SLOW.value)
+        self.assertEqual(report["fd_psc_outcome"], FDPSCState.REJECT_QUERY.value)
+        self.assertEqual(report["commit_query_access_count"], 1)
+        self.assertEqual(report["gates"]["current_gain"]["status"], "fail")
+        self.assertEqual(commit_candidate.call_count, 0)
+        self.assertEqual(system.state_machine.final_proposal_count, 1)
+        self.assertEqual(system.state_machine.final_gate_count, 1)
+        self.assertEqual(system.external.commit_query_access_count(episode_id), 1)
+        with self.assertRaises(CommitQueryAccessError):
+            system.external.issue_commit_query_token(episode_id, "retry-proposal")
+        for logical_id, adapter in system.injection.adapters.items():
+            self.assertTrue(
+                torch.equal(adapter.get_slow_factors().B, slow_before[logical_id][0])
+            )
+            self.assertTrue(
+                torch.equal(adapter.get_slow_factors().A, slow_before[logical_id][1])
+            )
+        self.assertTrue(bitwise_state_equal(system.replay.state_dict(), replay_before))
+        self.assertTrue(
+            bitwise_state_equal(system.subspaces.state_dict(), subspaces_before)
+        )
+        self.assertTrue(
+            bitwise_state_equal(system.exception_router.state_dict(), router_before)
+        )
+        self.assertEqual(system._commit_sequence, commit_sequence_before)
+        self.assertEqual(
+            system._successful_slow_commit_count,
+            slow_commit_count_before,
+        )
+        self.assertEqual(system.state_machine.state, FDPSCState.IDLE)
+        self.assertTheta0Bitwise(theta0)
+
+    def test_seeded_full_episode_is_bitwise_deterministic(self):
+        def run_once():
+            torch.manual_seed(3)
+            np.random.seed(3)
+            _, trainer, theta0 = self._trainer(learning_rate=0.25, steps=3)
+            system = trainer.fd_psc_system
+            obs, actions = _support_segment()
+            episode_id = system.next_episode_id
+            trainer.begin_fd_psc_episode(
+                episode_id,
+                "ctx",
+                initial_obs=obs,
+                metadata={"trajectory_id": "deterministic-episode"},
+            )
+            system.register_support_segment(obs, actions, iteration=0)
+            losses = trainer.finetune([obs], [actions])
+            report = trainer.end_fd_psc_episode([obs], [actions])
+            state = system._capture_canary_algorithm_state()
+            # The process-global RNG snapshot is independently exercised by
+            # transaction tests.  It is not owned by either coexisting system.
+            state.pop("rng")
+            stable_report = {
+                key: copy.deepcopy(report[key])
+                for key in (
+                    "fd_psc_outcome",
+                    "proposal_type",
+                    "committed",
+                    "candidate_count",
+                    "commit_query_access_count",
+                    "gates",
+                )
+            }
+            self.assertTheta0Bitwise(theta0)
+            return tuple(losses), stable_report, state
+
+        first = run_once()
+        second = run_once()
+        self.assertTrue(bitwise_state_equal(first, second))
+
     def test_cold_start_spectral_drift_gate_treats_zero_before_as_zero(self):
         _, trainer, theta0 = self._trainer(
             learning_rate=0.25,
@@ -1510,19 +1723,55 @@ class FDPSCIntegrationTests(unittest.TestCase):
             raise RuntimeError("synthetic planner exception")
 
         planner._plan_single = fail_after_update
-        with mock.patch("planning.adajepa_mpc._EnvWorkerProxy", return_value=object()):
+        with mock.patch(
+            "planning.adajepa_mpc._EnvWorkerProxy",
+            return_value=object(),
+        ), mock.patch.object(
+            trainer,
+            "end_fd_psc_episode",
+            wraps=trainer.end_fd_psc_episode,
+        ) as sleep, mock.patch.object(
+            trainer,
+            "abort_fd_psc_episode",
+            wraps=trainer.abort_fd_psc_episode,
+        ) as abort:
             with self.assertRaisesRegex(RuntimeError, "synthetic planner exception"):
                 planner.plan(initial_obs, goal_obs)
 
+        self.assertEqual(sleep.call_count, 0)
+        self.assertEqual(abort.call_count, 1)
         self.assertEqual(system.state_machine.state, FDPSCState.IDLE)
         self.assertEqual(system.state_machine.rollback_count, 1)
         self.assertEqual(system.external.commit_query_access_count(episode_id), 0)
+        self.assertEqual(system._support_segments, [])
         for key, adapter in system.injection.adapters.items():
             expected = slow_before[key]
             current = adapter.adapter_state_dict()
             self.assertTrue(torch.equal(current["slow_B"], expected["slow_B"]))
             self.assertTrue(torch.equal(current["slow_A"], expected["slow_A"]))
             self.assertEqual(current["active_exception_id"], expected["active_exception_id"])
+            self.assertTrue(torch.count_nonzero(adapter.pilot_B) == 0)
+            self.assertFalse(adapter.centered_active)
+
+        # The aborted planner episode must not poison the next episode's
+        # adapter route or local support lifecycle.
+        next_episode = system.next_episode_id
+        begin = trainer.begin_fd_psc_episode(
+            next_episode,
+            "ctx",
+            initial_obs=initial_obs,
+        )
+        self.assertIsNone(begin["route_adapter_id"])
+        self.assertEqual(system._support_segments, [])
+        self.assertTrue(
+            all(
+                torch.count_nonzero(adapter.pilot_B) == 0
+                and not adapter.centered_active
+                for adapter in system.injection.adapters.values()
+            )
+        )
+        trainer.abort_fd_psc_episode("planner_abort_next_episode_cleanup")
+        self.assertEqual(system.state_machine.state, FDPSCState.IDLE)
         self.assertTheta0Bitwise(theta0)
 
     def test_slow_commit_sidecar_round_trip_restores_memory_and_version(self):
@@ -1632,6 +1881,39 @@ class FDPSCIntegrationTests(unittest.TestCase):
         resumed_state, resumed_reference = resumed.checkpoints.load_latest()
         self.assertEqual(resumed_reference, saved_reference)
         self.assertEqual(resumed_state["commit_sequence"], resumed._commit_sequence)
+
+        for field, bad_value in (
+            ("base_checkpoint_hash", "f" * 64),
+            ("target_manifest_hash", "e" * 64),
+        ):
+            tampered = copy.deepcopy(saved_state)
+            tampered[field] = bad_value
+            with self.assertRaisesRegex(
+                CheckpointValidationError,
+                f"sidecar {field} mismatch",
+            ):
+                resumed._load_checkpoint_state(tampered)
+        self.assertEqual(resumed._commit_sequence, 1)
+        self.assertTrue(bitwise_state_equal(resumed.replay.state_dict(), replay_before))
+
+        # Resume is useful only if the restored process can execute the next
+        # full episode, not merely deserialize tensors.
+        next_episode = resumed.next_episode_id
+        resumed_trainer.begin_fd_psc_episode(
+            next_episode,
+            "ctx",
+            initial_obs=obs,
+            metadata={"trajectory_id": "post-resume-episode"},
+        )
+        resumed.register_support_segment(obs, actions, iteration=0)
+        next_losses = resumed_trainer.finetune([obs], [actions])
+        self.assertEqual(len(next_losses), 3)
+        next_report = resumed_trainer.end_fd_psc_episode([obs], [actions])
+        self.assertGreater(next_report["candidate_count"], 0)
+        self.assertEqual(next_report["commit_query_access_count"], 1)
+        self.assertEqual(resumed._episode_sequence, 2)
+        self.assertEqual(resumed.state_machine.state, FDPSCState.IDLE)
+        self.assertTrue((self.root / "fd_psc_metrics.jsonl").is_file())
         self.assertTheta0Bitwise(resumed_theta0)
 
     def test_noncommit_episode_snapshots_restore_route_usage_ledger_and_rng(self):
@@ -3039,10 +3321,26 @@ class FDPSCIntegrationTests(unittest.TestCase):
         )
         resumed = resumed_trainer.fd_psc_system
         self.assertEqual(resumed.exception_router.adapter_ids(), (adapter_id,))
+        global_replay_before = copy.deepcopy(resumed.replay.state_dict())
+        subspaces_before = copy.deepcopy(resumed.subspaces.state_dict())
+        slow_before = {
+            logical_id: (
+                adapter.get_slow_factors().B.detach().clone(),
+                adapter.get_slow_factors().A.detach().clone(),
+            )
+            for logical_id, adapter in resumed.injection.adapters.items()
+        }
+        exception_before = copy.deepcopy(
+            resumed.exception_router.get(adapter_id).adapter_state
+        )
+        local_replay_count_before = len(
+            resumed.exception_router.get(adapter_id).local_replay
+        )
         begin = resumed_trainer.begin_fd_psc_episode(
             resumed.next_episode_id,
             "ctx",
             initial_obs=obs,
+            metadata={"trajectory_id": "exception-replacement-episode"},
         )
         self.assertEqual(begin["route_adapter_id"], adapter_id)
         for logical_id, adapter in resumed.injection.adapters.items():
@@ -3052,7 +3350,35 @@ class FDPSCIntegrationTests(unittest.TestCase):
             else:
                 self.assertGreater(adapter.get_exception_factors().rank, 0)
                 self.assertEqual(adapter.active_exception_id, adapter_id)
-        resumed.finish_episode_without_sleep("sparse_exception_restore_verified")
+
+        resumed.register_support_segment(obs, actions, iteration=0)
+        resumed_trainer.finetune([obs], [actions])
+        replace_report = resumed_trainer.end_fd_psc_episode([obs], [actions])
+        self.assertTrue(replace_report["committed"])
+        self.assertEqual(
+            replace_report["proposal_type"],
+            ProposalType.REPLACE_EXCEPTION.value,
+        )
+        self.assertEqual(replace_report["commit_query_access_count"], 1)
+        self.assertEqual(resumed.exception_router.adapter_ids(), (adapter_id,))
+        replaced = resumed.exception_router.get(adapter_id)
+        self.assertEqual(replaced.usage_count, 2)
+        self.assertGreater(len(replaced.local_replay), local_replay_count_before)
+        self.assertFalse(bitwise_state_equal(replaced.adapter_state, exception_before))
+        self.assertTrue(
+            bitwise_state_equal(resumed.replay.state_dict(), global_replay_before)
+        )
+        self.assertTrue(
+            bitwise_state_equal(resumed.subspaces.state_dict(), subspaces_before)
+        )
+        for logical_id, adapter in resumed.injection.adapters.items():
+            self.assertTrue(
+                torch.equal(adapter.get_slow_factors().B, slow_before[logical_id][0])
+            )
+            self.assertTrue(
+                torch.equal(adapter.get_slow_factors().A, slow_before[logical_id][1])
+            )
+        self.assertEqual(resumed.state_machine.state, FDPSCState.IDLE)
         self.assertTheta0Bitwise(resumed_theta0)
 
     def test_repair_trajectory_uses_support_and_replay_and_screens_only_clones(self):

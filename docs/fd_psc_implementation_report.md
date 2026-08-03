@@ -174,7 +174,7 @@ IDLE -> EPISODE_PILOT -> [EPISODE_CENTERED] -> SLEEP_CALIBRATION
 | Gate 7 canary | `fd_psc/canary.py`; `fd_psc/trainer.py`: `_run_canary_phase`, known-good period helpers |
 | 单 final proposal/query state machine | `fd_psc/state_machine.py`; `fd_psc/external_data.py`: commit-query token ledger |
 | 事务与 sidecar | `fd_psc/transaction.py`, `fd_psc/checkpoint.py` |
-| 指标、诊断、报告 | `fd_psc/metrics.py`, `fd_psc/diagnostics.py`, `fd_psc/experiment_reporting.py` |
+| 指标、诊断、报告 | `fd_psc/metrics.py`, `fd_psc/diagnostics.py`, `fd_psc/experiment_reporting.py`；最终 JSON/CSV 对第 28 节全部必需指标逐项记录 `available`/显式不可用状态，不用伪造的 0 填补缺测 |
 
 ## 5. 测试结果
 
@@ -187,7 +187,7 @@ IDLE -> EPISODE_PILOT -> [EPISODE_CENTERED] -> SLEEP_CALIBRATION
   -m unittest discover -s tests -p 'test_fd_psc*.py' -v
 ```
 
-当前主线精确复跑结果：`Ran 175 tests in 10.620s ... OK`。该结果来自上述带 `-p 'test_fd_psc*.py'` 的完整 FD-PSC 测试命令；其中 `tests.test_fd_psc_integration` 包含 `37` 项并全部通过。
+当前主线精确复跑结果：`Ran 180 tests in 11.125s ... OK`。该结果来自上述带 `-p 'test_fd_psc*.py'` 的完整 FD-PSC 测试命令；仓库内 17 个 Python 测试文件全部匹配该模式，没有被过滤掉的其他 `test*.py`；其中 `tests.test_fd_psc_integration` 包含 `41` 项并全部通过。测试套件没有 skip 或 xfail。
 
 静态编译检查也已通过：
 
@@ -203,6 +203,7 @@ Python 3.9.25
 PyTorch 2.3.0+cu121
 torch.version.cuda = 12.1
 torch.cuda.is_available() = True
+GPU = NVIDIA GeForce RTX 4060 Laptop GPU
 Windows 10.0.26200
 ```
 
@@ -222,7 +223,13 @@ Windows 10.0.26200
 - repair/new/replace exception、Gates 1–7、known-good K-period rollback/resume；
 - atomic checkpoint、latest recovery、journal/envelope/pointer 交叉验证、prepared/aborted tombstone、rollback、retention 与完整 sidecar round trip；
 - `accumulate` 完整 adapter state 恢复、`plain_svd` 事务提交/故障回滚，以及 checkpoint 后 metric sequence 可复现；
-- Section 28 指标的数值定义、显式 nullable status、JSONL/CSV 无 NaN 导出和 context retention 统计；
+- 普通 slow sidecar 恢复后再完成下一个真实 episode；sidecar base/target hash 独立篡改均 fail-fast 且不污染已恢复状态；
+- 多 calibration candidate 只能形成一个 final proposal，commit-query 只访问一次，Gate 失败后终止且 replay/subspace/router/commit counters 不变；
+- 零 task vector 和 support 不足路径都不生成 proposal、不访问 query；planner 异常只 abort 不 sleep，下一 episode 无 route/support 污染；
+- exception 的 new→checkpoint resume→route→在线更新→atomic replace 全链路；replace 只更新 exception-local adapter/replay，不修改 global slow/replay/Q；
+- 同 seed 的两个完整 online/sleep/commit episode 得到位级一致的持久算法状态；
+- CUDA 卷积可能产生的 trailing-singleton 非标准 stride 下，`theta_0` 审计仍执行严格字节比较并能检出修改；
+- Section 28 指标的数值定义、显式 nullable status、JSONL/CSV 无 NaN 导出、context retention 统计，以及最终报告对全部必需指标的逐项 coverage contract；
 - experiment runner、结果 JSON/CSV、保留 override 和 report lifecycle。
 
 测试期间 PyTorch 对偶数 kernel 的 `padding='same'` 打印一条可能产生内部 zero-padded copy 的 warning；对应数值 hook/Conv 几何测试通过，warning 不是失败。
@@ -233,7 +240,19 @@ Windows 10.0.26200
 
 - `python scripts/generate_fd_psc_manifest.py --help`：exit 0。
 - `python scripts/run_fd_psc_experiment.py --help`：exit 0。
-- `python scripts/run_fd_psc_experiment.py --variant frozen_adajepa --seed 0 --output-root <系统临时目录> --dry-run`：exit 0，生成隔离 run/memory 路径以及命令/结果 JSON。该命令只验证 runner 编排，不加载真实模型，也不是规划 smoke。
+- manifest generator 正例：六 split 共 6 条固定记录，原子生成 manifest，checksum/leakage audit 为 `pass`；故意复用 trajectory ID 的反例被 `external split leakage` 拒绝。
+- `conf/fd_psc/experiments.yaml` 的全部 `29/29` variants 均以相同 synthetic manifest 完成 `--dry-run`，每个 run 的 metadata/result JSON 可读且 29 个 writable state directory 两两隔离。dry-run 只验证 runner 编排，不加载真实模型，也不是规划 smoke。
+- 六个官方配置 `adajepa_plan_{cem,gd}_{maze,diversemaze,pushobj}` 均通过 `plan.py --config-name <name> --cfg job` Hydra 组合，exit 0。
+
+### 5.3 CUDA 本机 smoke
+
+状态：`PASS`（单 GPU 轻量级功能 smoke，不是正式性能或多精度矩阵）。
+
+- CUDA FP16 autocast 下，`DualLoRALinear` 与 grouped `DualLoRAConv2d` 均完成 forward/backward；base weight/bias 无梯度，adapter 梯度存在且有限。
+- CUDA float32 下，activation subspace/SVD、rank selection、dual-constraint projection 和 `slice_exact` 均完成，输出保留在 GPU。
+- 完整 CUDA toy episode 完成 begin → 三次 online update → sleep/calibration → 唯一 commit-query → `COMMIT_SLOW`；`candidate_count=1`、`commit_query_access_count=1`、`commit_sequence=1`、replay 新增 1 个 window，`theta_0` 位级不变。
+- 首次完整 CUDA episode 暴露并已修复冻结基座审计 bug：CUDA Conv kernel 的 trailing singleton stride 可能大于 1，旧代码直接 `view(torch.uint8)` 会异常；现先展平为真实 stride-1 字节视图，并有 CPU 可复现回归测试验证“不误报且仍能检出修改”。
+- grouped Conv backward 出现一次 cuDNN execution-plan unsupported fallback warning，但 backward 成功、梯度有限；该 warning 不等于正式 GPU 兼容性矩阵通过。
 
 ## 6. 未运行的测试及原因
 
@@ -244,7 +263,8 @@ Windows 10.0.26200
 | 真实 MPC maze/diversemaze/pushobj smoke | `UNRUN` | 缺 checkpoint、eval dataset 和可运行环境 |
 | 真实机器人/物理环境 rollout | `UNRUN` | 未提供机器人服务、环境资产或固定 seeds |
 | 真实 resettable Gate-7 canary | `UNRUN` | 未提供 canary manifest 和独立可复位 evaluator/worker |
-| CUDA 数值一致性矩阵（多 GPU/精度） | `UNRUN` | 本轮目标是实现与离线 CPU/mock 验证，未安排硬件矩阵 |
+| 多 GPU、BF16/FP32/FP16 交叉数值一致性矩阵 | `UNRUN` | 已通过 RTX 4060 单 GPU 的 FP16 算子和 FP32 完整 toy episode；但没有第二张 GPU、正式模型和固定容差协议 |
+| 官方训练入口 `train.py --cfg job` | `UNRUN` | 当前项目虚拟环境在导入阶段缺少 `accelerate`（`ModuleNotFoundError`）；未擅自修改环境依赖 |
 | 正式性能、吞吐、显存 benchmark | `UNRUN` | 无真实 checkpoint/input/batch/hardware protocol，任意数字都不可比较 |
 | 多 seed scientific baseline/ablation | `UNRUN` | 缺真实数据和 rollout budget；不能用 mock loss 替代论文结果 |
 
@@ -254,7 +274,7 @@ Windows 10.0.26200
 
 仓库扫描未找到模型 checkpoint 或真实 external manifest/split；因此没有执行真实模型 load、真实 planner episode、环境 success 判定或真实 report-test。已通过的 synthetic toy integration 使用 CPU 友好的 mock AdaJEPA 网络和固定 JSON fixture，只证明协议与代码路径可运行，不证明真实任务收益。
 
-唯一已运行的命令级 smoke 是 `frozen_adajepa --dry-run`，它验证隔离目录和命令展开，明确不等价于：
+已运行的非真实资源 smoke 包括 29 个 variant dry-run、六个 planner 配置组合和完整 CUDA toy episode；它们验证编排、设备路径和协议状态机，仍明确不等价于：
 
 - checkpoint smoke；
 - FD-PSC enabled smoke；
@@ -276,7 +296,7 @@ Windows 10.0.26200
 - episodic/slow/subspace rank、candidate count、exception count；
 - canary rollout budget/status。
 
-离线完整单元测试在当前环境中的本次 unittest runner 报告耗时 `10.620` 秒；这是小型 mock 测试套件时间，不是模型吞吐或算法 overhead benchmark，不能与原 ADAJEPA 性能比较。虽然当前 PyTorch 报告 CUDA 可用，本轮没有在固定真实模型/batch/precision 下采集 `torch.cuda.max_memory_allocated()`，所以显存峰值仍为 `UNRUN`。
+离线完整单元测试在当前环境中的本次 unittest runner 报告耗时 `11.125` 秒；这是小型 mock 测试套件时间，不是模型吞吐或算法 overhead benchmark，不能与原 ADAJEPA 性能比较。轻量 CUDA 算子 smoke 曾记录 `torch.cuda.max_memory_allocated()=17,860,608` bytes，但它不是固定真实模型/batch/warm-up 下的峰值，因此正式显存结果仍为 `UNRUN`。
 
 正式 benchmark 至少要固定 checkpoint hash、encoder/predictor target manifest、输入分辨率、batch/window 数、precision、GPU、warm-up、同步策略、episode/replan 数，并分别报告 disabled、episodic-only 和完整 FD-PSC。
 
