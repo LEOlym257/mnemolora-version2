@@ -163,13 +163,38 @@ class ActivationSubspace:
     ) -> "ActivationSubspace":
         """Build ``Q=Vh.T`` from ``H`` shaped ``N x din``."""
 
+        state, _ = cls.from_activations_with_tail(
+            activations,
+            maximum_rank=maximum_rank,
+            spectral_energy_threshold=spectral_energy_threshold,
+            minimum_energy=minimum_energy,
+        )
+        return state
+
+    @classmethod
+    def from_activations_with_tail(
+        cls,
+        activations: torch.Tensor,
+        maximum_rank: int = 64,
+        spectral_energy_threshold: float = 0.99,
+        minimum_energy: float = 1.0e-8,
+    ) -> Tuple["ActivationSubspace", float]:
+        """Build the retained subspace and return ``lambda_(m+1)``.
+
+        This is the single activation-SVD implementation used by both legacy
+        :meth:`from_activations` and FSD V2 fresh replay geometry.  The tail is
+        the first discarded eigenvalue of ``H.T @ H / N``.  Consequently a
+        non-empty activation matrix may have retained rank zero while still
+        carrying a positive conservative tail bound.
+        """
+
         if activations.ndim != 2:
             raise ValueError("activation matrix must have shape N x din")
         if not 0.0 < spectral_energy_threshold <= 1.0:
             raise ValueError("spectral_energy_threshold must be in (0, 1]")
         input_dim = int(activations.shape[1])
-        if activations.shape[0] == 0 or maximum_rank <= 0:
-            return cls.empty(input_dim, device=activations.device)
+        if activations.shape[0] == 0 or input_dim == 0:
+            return cls.empty(input_dim, device=activations.device), 0.0
         h = activations.detach().to(dtype=torch.float32)
         if not torch.isfinite(h).all():
             raise ValueError("non-finite activations cannot update Q/lambda")
@@ -181,12 +206,17 @@ class ActivationSubspace:
             maximum_rank,
             minimum_energy,
         )
+        tail_upper_bound = (
+            float(covariance_energies[rank].detach().to(dtype=torch.float64).cpu())
+            if rank < int(covariance_energies.numel())
+            else 0.0
+        )
         if rank == 0:
-            return cls.empty(input_dim, device=h.device)
+            return cls.empty(input_dim, device=h.device), tail_upper_bound
         # The input directions are right singular vectors, never U.
         q = vh[:rank].transpose(0, 1).contiguous()
         energies = covariance_energies[:rank]
-        return cls(q, energies.to(dtype=torch.float32))
+        return cls(q, energies.to(dtype=torch.float32)), tail_upper_bound
 
     def soft_ness_weights(
         self,

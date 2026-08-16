@@ -164,6 +164,15 @@ class LogicalLoRAAdapter(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         empty_b = torch.empty((self.out_features, 0), **factory_kwargs)
         empty_a = torch.empty((0, self.in_features), **factory_kwargs)
+        # FSD V2 core memory is a persistent full-depth delta.  It is kept
+        # separate from theta_0 and from every low-rank branch so the official
+        # checkpoint remains bitwise immutable and rank recycling has an
+        # auditable destination.
+        self.register_buffer(
+            "core_delta",
+            torch.zeros((self.out_features, self.in_features), **factory_kwargs),
+            persistent=True,
+        )
         self.register_buffer("slow_B", empty_b.clone(), persistent=True)
         self.register_buffer("slow_A", empty_a.clone(), persistent=True)
         self.register_buffer("exception_B", empty_b.clone(), persistent=True)
@@ -360,6 +369,25 @@ class LogicalLoRAAdapter(nn.Module):
         b, a = self._validated_persistent_factors(b, a, "slow")
         self.slow_B, self.slow_A = b, a
 
+    def get_core_delta(self) -> Tensor:
+        return self.core_delta
+
+    def replace_core_delta(self, value: Tensor) -> None:
+        if not torch.is_tensor(value) or value.ndim != 2:
+            raise ValueError("core_delta must be a matrix")
+        if tuple(value.shape) != (self.out_features, self.in_features):
+            raise ValueError(
+                "core_delta shape mismatch: "
+                f"got {tuple(value.shape)}, expected "
+                f"({self.out_features}, {self.in_features})"
+            )
+        if not torch.isfinite(value).all():
+            raise ValueError("core_delta must be finite")
+        ref = self._reference()
+        self.core_delta = value.detach().to(
+            device=ref.device, dtype=ref.dtype
+        ).clone()
+
     def set_active_exception(
         self,
         B: FactorInput,
@@ -444,7 +472,7 @@ class LogicalLoRAAdapter(nn.Module):
             return None if t is None else t.detach().clone()
 
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "logical_id": self.logical_id,
             "in_features": self.in_features,
             "out_features": self.out_features,
@@ -452,6 +480,7 @@ class LogicalLoRAAdapter(nn.Module):
             "alpha": self.alpha,
             "dropout": self.dropout_p,
             "adapters_enabled": self.adapters_enabled,
+            "core_delta": copy(self.core_delta),
             "slow_B": copy(self.slow_B),
             "slow_A": copy(self.slow_A),
             "exception_B": copy(self.exception_B),
@@ -552,7 +581,7 @@ class LogicalLoRAAdapter(nn.Module):
 
     def load_adapter_state_dict(self, state: Mapping[str, Any]) -> None:
         version = int(state.get("schema_version", -1))
-        if version != 1:
+        if version not in {1, 2}:
             raise ValueError(f"unsupported adapter state schema {version}")
         if int(state["in_features"]) != self.in_features or int(state["out_features"]) != self.out_features:
             raise ValueError("adapter state dimensions do not match logical layer")
@@ -569,6 +598,10 @@ class LogicalLoRAAdapter(nn.Module):
                 raise ValueError(f"adapter state '{name}' must be a tensor")
             return value.detach().to(device=ref.device, dtype=ref.dtype).clone()
 
+        if version >= 2:
+            self.replace_core_delta(tensor("core_delta"))
+        else:
+            self.replace_core_delta(torch.zeros_like(self.core_delta))
         self.replace_slow_adapter(tensor("slow_B"), tensor("slow_A"))
         exc_b, exc_a = tensor("exception_B"), tensor("exception_A")
         if exc_a.shape[0]:
@@ -612,9 +645,20 @@ class LogicalLoRAAdapter(nn.Module):
     def materialize_effective_delta(
         self, maximum_elements: int = _DEFAULT_MATERIALIZE_LIMIT
     ) -> Tensor:
-        return self.get_effective_factors().materialize(maximum_elements)
+        if self.core_delta.numel() > maximum_elements:
+            raise RuntimeError(
+                f"refusing to materialize {self.core_delta.numel()} adapter elements "
+                f"(limit={maximum_elements})"
+            )
+        if not self.adapters_enabled:
+            return torch.zeros_like(self.core_delta)
+        low_rank = self.get_effective_factors().materialize(maximum_elements)
+        return self.core_delta + low_rank
 
     def _apply_factors(self, x: Tensor, B: Tensor, A: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    def _apply_core(self, x: Tensor) -> Tensor:
         raise NotImplementedError
 
     def _adapter_delta(self, x: Tensor) -> Optional[Tensor]:
@@ -626,6 +670,10 @@ class LogicalLoRAAdapter(nn.Module):
             nonlocal result
             result = value if result is None else result + value
 
+        # Keep the dense branch live even when it is numerically zero: during
+        # Deep Sleep it is a leaf buffer with gradients enabled and must
+        # receive the first optimization step from the zero state.
+        add(self._apply_core(x))
         if self.slow_A.shape[0]:
             add(self._apply_factors(x, self.slow_B, self.slow_A))
         if self.exception_A.shape[0]:
@@ -689,6 +737,9 @@ class DualLoRALinear(LogicalLoRAAdapter):
 
     def _apply_factors(self, x: Tensor, B: Tensor, A: Tensor) -> Tensor:
         return F.linear(F.linear(x, A, bias=None), B, bias=None)
+
+    def _apply_core(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.core_delta, bias=None)
 
     def forward(self, x: Tensor) -> Tensor:
         output = self.base_layer(x)
@@ -773,6 +824,24 @@ class ConvLoRAGroup(LogicalLoRAAdapter):
         )
         b_kernel = B.reshape(self.out_channels_per_group, rank, 1, 1)
         return F.conv2d(hidden, b_kernel, bias=None, stride=1, padding=0)
+
+    def _apply_core(self, x: Tensor) -> Tensor:
+        kernel = self.core_delta.reshape(
+            self.out_channels_per_group,
+            self.in_channels_per_group,
+            self.kernel_size[0],
+            self.kernel_size[1],
+        )
+        padded, padding = self._prepare_input(x)
+        return F.conv2d(
+            padded,
+            kernel,
+            bias=None,
+            stride=self.stride,
+            padding=padding,
+            dilation=self.dilation,
+            groups=1,
+        )
 
     def materialize_effective_delta(
         self, maximum_elements: int = _DEFAULT_MATERIALIZE_LIMIT
@@ -984,13 +1053,13 @@ class DualLoRAConv2d(nn.Module):
 
     def adapter_state_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "logical_id": self.logical_id,
             "groups": [g.adapter_state_dict() for g in self.logical_groups],
         }
 
     def load_adapter_state_dict(self, state: Mapping[str, Any]) -> None:
-        if int(state.get("schema_version", -1)) != 1:
+        if int(state.get("schema_version", -1)) not in {1, 2}:
             raise ValueError("unsupported ConvLoRA adapter state schema")
         groups = state.get("groups")
         if not isinstance(groups, Sequence) or len(groups) != self.groups:

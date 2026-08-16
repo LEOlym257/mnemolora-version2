@@ -1,0 +1,143 @@
+enabled: true
+seed: ${seed}
+run_mode: fsd_v2
+
+target_modules:
+  predictor_linear: true
+  post_backbone_projection_linear: true
+  action_encoder_linear: false
+  proprio_encoder_linear: false
+  exclude_frozen_backbone: true
+  require_active_forward_path: true
+  fail_on_empty_predictor_targets: true
+  fail_on_empty_projection_targets: false
+  require_projection_targets_if_head_exists: true
+
+episodic_lora:
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  pilot_enabled: true
+  a_initialization: kaiming_uniform
+  b_initialization: zeros
+
+conv_lora:
+  enabled: true
+  target_scope: post_backbone_projection_head
+  parameterization: flattened_kernel
+  groups_mode: groupwise
+
+slow_lora:
+  persistent_rank: 32
+  maximum_rank: 32
+
+rtrc:
+  enabled: true
+  budget_fraction_initial: 0.20
+  budget_fraction_minimum: 0.02
+  budget_fraction_maximum: 1.00
+  geometry_windows: 128
+  geometry_maximum_rank: 64
+  geometry_energy_threshold: 0.999
+  minimum_energy: 1.0e-8
+  use_shared_dual: true
+  layer_weight_mode: relative_output_energy
+  tail_mode: conservative_isotropic
+  bisection_iterations: 80
+  bisection_relative_tolerance: 1.0e-7
+  epsilon: 1.0e-8
+
+raw_replay:
+  historical_windows: 512
+  store_model_input_obs: true
+  store_frozen_visual_latent_cache: false
+  image_storage_dtype: uint8_or_source
+  auxiliary_dtype: float32
+  maximum_context_clusters: 32
+  minimum_windows_per_cluster: 4
+
+adaptive_budget:
+  enabled: true
+  controller_learning_rate: 0.25
+  plasticity_loss_target: 0.10
+  history_regression_target: 0.01
+  history_weight: 2.0
+  error_clip: 1.0
+  minimum_wake_gain: 1.0e-8
+
+deep_sleep:
+  enabled: true
+  trigger_relative_rank_error: 0.05
+  trigger_consecutive_commits: 3
+  minimum_replay_windows: 64
+  strategy: residual_distill
+  maximum_steps: 100
+  learning_rate: 1.0e-5
+  output_residual_weight: 1.0
+  hidden_residual_weight: 0.25
+  current_task_weight: 0.25
+  residual_rank: 8
+  batch_size: 8
+  hidden_layer_maximum: 4
+  validation_fraction: 0.20
+  minimum_validation_windows: 8
+  functional_error_threshold: 0.02
+  functional_error_absolute_tolerance: 1.0e-8
+  epsilon: 1.0e-8
+  core_storage:
+    mode: dense_delta
+
+# FSD V2 wake is the ordinary online JEPA loss.  These V1 correction/search
+# components remain available to legacy run modes but do not participate here.
+gradient_geometry:
+  enabled: false
+
+slice:
+  enabled: false
+
+sdc:
+  enabled: false
+
+spectral_surgery:
+  enabled: false
+
+activation_subspace:
+  enabled: false
+
+merge:
+  soft_ness_enabled: false
+
+repair:
+  enabled: false
+
+exception:
+  enabled: false
+  maximum_adapters: 0
+  local_replay_windows: 0
+
+gates:
+  allow_unsafe_ablation: false
+  current_gain_enabled: false
+  history_enabled: false
+  anchor_enabled: false
+  plasticity_enabled: false
+  functional_error_enabled: false
+  spectral_drift_enabled: false
+
+canary:
+  enabled: false
+
+checkpoint:
+  enabled: true
+  state_directory: fsd_v2_state
+  latest_pointer_path: fsd_v2_state/latest.json
+  resume_path: null
+  save_every_episodes: 1
+  retention_versions: 20
+  keep_commit_journal: true
+  atomic_write: true
+
+logging:
+  per_layer_metrics: true
+  save_candidate_reports: false
+  save_gradient_statistics: false

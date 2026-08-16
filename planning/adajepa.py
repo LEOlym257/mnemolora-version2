@@ -50,9 +50,12 @@ class AdaJEPATrainer:
         self.fd_psc_config = FDPSCConfig.from_mapping(fd_psc)
         self.fd_psc_system = None
         if self.fd_psc_config.enabled:
-            from fd_psc.trainer import FDPSCSystem
+            if self.fd_psc_config.run_mode == "fsd_v2":
+                from fd_psc.v2.system import FSDV2System as MemorySystem
+            else:
+                from fd_psc.trainer import FDPSCSystem as MemorySystem
 
-            self.fd_psc_system = FDPSCSystem(
+            self.fd_psc_system = MemorySystem(
                 wm=self.wm,
                 config=self.fd_psc_config,
                 runtime_output_dir=Path(runtime_output_dir or "."),
@@ -150,6 +153,12 @@ class AdaJEPATrainer:
             return []
         system = self.fd_psc_system
         system.require_active_episode()
+        # Some legacy tests and integrations provide a protocol-compatible
+        # system double without exposing its concrete config object.
+        is_fsd_v2 = (
+            getattr(getattr(system, "config", None), "run_mode", None)
+            == "fsd_v2"
+        )
         if merge and len(obs_seqs) > 1:
             obs_seqs, act_seqs = self._merge_segments(obs_seqs, act_seqs)
         segments = [self._prepare_segment(o, a) for o, a in zip(obs_seqs, act_seqs)]
@@ -161,11 +170,15 @@ class AdaJEPATrainer:
             predictor_train=True,
             encoder_train=self.finetune_encoder,
         )
-        optimizer = self._make_optimizer()
         detach_src = not self.finetune_encoder
         detach_tgt = True if not self.finetune_encoder else bool(getattr(self.wm, "stop_grad", True))
         step_losses = []
+        optimizer = None
         try:
+            # Optimizer validation/construction is part of online mode.  If it
+            # fails, the finally block must still return Dropout/module modes
+            # and episodic requires_grad flags to their frozen state.
+            optimizer = self._make_optimizer()
             for step in range(self.steps):
                 optimizer.zero_grad()
                 def loss_closure():
@@ -185,26 +198,34 @@ class AdaJEPATrainer:
                         ]
                     ).mean()
 
-                forward_rng = system.capture_update_rng()
-                loss = loss_closure()
-                # Event-triggered SDC owns the exact two-pass backward.  When
-                # inactive this is precisely the original single backward;
-                # the JEPA scalar, target detach semantics, optimizer, and
-                # optimizer recreation schedule remain unchanged.
-                system.backward_with_sdc(
-                    loss,
-                    optimizer,
-                    loss_closure=loss_closure,
-                    forward_rng=forward_rng,
-                )
+                if is_fsd_v2:
+                    # First-round V2 intentionally has one wake objective and
+                    # no legacy SDC/GRASP side path.
+                    loss = loss_closure()
+                    loss.backward()
+                else:
+                    # Preserve the exact legacy order: the RNG snapshot must
+                    # precede the first stochastic forward so SDC can replay
+                    # that same dropout/random stream on its second pass.
+                    forward_rng = system.capture_update_rng()
+                    loss = loss_closure()
+                    # Event-triggered SDC owns the exact two-pass backward.
+                    system.backward_with_sdc(
+                        loss,
+                        optimizer,
+                        loss_closure=loss_closure,
+                        forward_rng=forward_rng,
+                    )
                 optimizer.step()
                 step_losses.append(float(loss.detach()))
                 system.note_optimizer_step(step + 1, step_losses[-1])
-                centered_activated = system.after_optimizer_step(
-                    self,
-                    segments,
-                    step_losses,
-                )
+                centered_activated = False
+                if not is_fsd_v2:
+                    centered_activated = system.after_optimizer_step(
+                        self,
+                        segments,
+                        step_losses,
+                    )
                 log.info(
                     "FD-AdaJEPA step %d/%d  pred_loss=%.6f",
                     step + 1,
@@ -217,15 +238,19 @@ class AdaJEPATrainer:
                     # the next real step so those parameters participate.
                     optimizer.zero_grad(set_to_none=True)
                     optimizer = self._make_optimizer()
-            system.after_finetune_event(
-                self,
-                segments,
-                step_losses,
-                conflict_evaluated_per_step=True,
-            )
+            if is_fsd_v2:
+                system.finish_online_event(self, segments, step_losses)
+            else:
+                system.after_finetune_event(
+                    self,
+                    segments,
+                    step_losses,
+                    conflict_evaluated_per_step=True,
+                )
             return step_losses
         finally:
-            optimizer.zero_grad(set_to_none=True)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
             system.finish_online_mode()
 
     def begin_fd_psc_episode(self, episode_id, context_identifier, initial_obs=None, metadata=None):

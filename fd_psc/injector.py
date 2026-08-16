@@ -101,6 +101,18 @@ class InjectionResult:
     _base_eval_hook: Optional[Any] = field(default=None, repr=False)
     _seed: int = field(default=0, repr=False)
     _episode_counter: int = field(default=0, repr=False)
+    _original_modules: Dict[str, nn.Module] = field(default_factory=dict, repr=False)
+    _original_parameter_requires_grad: Tuple[Tuple[nn.Parameter, bool], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    _original_training: Tuple[Tuple[nn.Module, bool], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    _had_encoder_protocol: bool = field(default=False, repr=False)
+    _previous_encoder_protocol: Any = field(default=None, repr=False)
+    _restored_original_model: bool = field(default=False, repr=False)
 
     def _parameters_for_group(self, group: str) -> List[nn.Parameter]:
         entries = self.manifest.by_logical_id()
@@ -181,6 +193,35 @@ class InjectionResult:
         if self._base_eval_hook is not None:
             self._base_eval_hook.remove()
             self._base_eval_hook = None
+
+    def restore_original_model(self, wm: nn.Module) -> None:
+        """Undo adapter replacement after a failed system construction.
+
+        Normal system shutdown intentionally keeps the injected topology.
+        This explicit rollback exists for constructor failures, especially an
+        invalid/incompatible resume sidecar, so the caller may safely retry
+        with the same world-model object.
+        """
+
+        if self._restored_original_model:
+            return
+        self.close()
+        for path, original in sorted(
+            self._original_modules.items(),
+            key=lambda item: item[0].count("."),
+            reverse=True,
+        ):
+            parent, name = _resolve_parent(wm, path)
+            _replace_child(parent, name, original)
+        if self._had_encoder_protocol:
+            setattr(wm, "_fd_psc_encoder_adapter", self._previous_encoder_protocol)
+        elif hasattr(wm, "_fd_psc_encoder_adapter"):
+            delattr(wm, "_fd_psc_encoder_adapter")
+        for parameter, required_grad in self._original_parameter_requires_grad:
+            parameter.requires_grad_(required_grad)
+        for module, was_training in self._original_training:
+            module.training = was_training
+        self._restored_original_model = True
 
 
 @dataclass
@@ -587,96 +628,132 @@ def inject_fd_psc_adapters(
             encoder_adapter=None,
         )
 
-    manifest, _ = enumerate_fd_psc_targets(wm, config, schema_sample=schema_sample)
-    encoder_adapter = install_encoder_adapter_protocol(wm)
-    # theta_0 is the entire base model, not merely selected old AdaJEPA params.
-    for parameter in wm.parameters():
-        parameter.requires_grad_(False)
+    original_parameter_requires_grad = tuple(
+        (parameter, bool(parameter.requires_grad)) for parameter in wm.parameters()
+    )
+    original_training = tuple(
+        (module, bool(module.training)) for module in wm.modules()
+    )
+    had_encoder_protocol = hasattr(wm, "_fd_psc_encoder_adapter")
+    previous_encoder_protocol = getattr(wm, "_fd_psc_encoder_adapter", None)
+    original_modules: Dict[str, nn.Module] = {}
+    hook = None
+    try:
+        manifest, _ = enumerate_fd_psc_targets(wm, config, schema_sample=schema_sample)
+        encoder_adapter = install_encoder_adapter_protocol(wm)
+        # theta_0 is the entire base model, not merely selected old AdaJEPA params.
+        for parameter in wm.parameters():
+            parameter.requires_grad_(False)
 
-    rank = int(_cfg_get(config, "episodic_lora.rank", 8))
-    alpha = float(_cfg_get(config, "episodic_lora.alpha", 16.0))
-    dropout = float(_cfg_get(config, "episodic_lora.dropout", 0.0))
-    global_seed = int(_cfg_get(config, "seed", 0))
-    entries_by_path: Dict[str, List[ManifestEntry]] = {}
-    for entry in manifest.entries:
-        entries_by_path.setdefault(entry.module_path, []).append(entry)
+        rank = int(_cfg_get(config, "episodic_lora.rank", 8))
+        alpha = float(_cfg_get(config, "episodic_lora.alpha", 16.0))
+        dropout = float(_cfg_get(config, "episodic_lora.dropout", 0.0))
+        global_seed = int(_cfg_get(config, "seed", 0))
+        entries_by_path: Dict[str, List[ManifestEntry]] = {}
+        for entry in manifest.entries:
+            entries_by_path.setdefault(entry.module_path, []).append(entry)
 
-    adapters: Dict[str, LogicalLoRAAdapter] = {}
-    physical_modules: Dict[str, nn.Module] = {}
-    injected_paths: Set[str] = set()
-    for path in sorted(entries_by_path):
-        path_entries = entries_by_path[path]
-        if not any(entry.default_inject for entry in path_entries):
-            continue
-        module = wm.get_submodule(path)
-        parent, name = _resolve_parent(wm, path)
-        if isinstance(module, nn.Linear):
-            logical_id = path_entries[0].logical_layer_id
-            wrapper = DualLoRALinear(
-                module,
-                rank=rank,
-                alpha=alpha,
-                dropout=dropout,
-                generator=_generator(module.weight.device, _stable_seed(global_seed, logical_id)),
-                logical_id=logical_id,
-            )
-            _replace_child(parent, name, wrapper)
-            adapters[logical_id] = wrapper
-            physical_modules[path] = wrapper
-        elif isinstance(module, nn.Conv2d):
-            generators = [
-                _generator(
-                    module.weight.device,
-                    _stable_seed(global_seed, f"{path}::group={group_index}"),
+        adapters: Dict[str, LogicalLoRAAdapter] = {}
+        physical_modules: Dict[str, nn.Module] = {}
+        injected_paths: Set[str] = set()
+        for path in sorted(entries_by_path):
+            path_entries = entries_by_path[path]
+            if not any(entry.default_inject for entry in path_entries):
+                continue
+            module = wm.get_submodule(path)
+            parent, name = _resolve_parent(wm, path)
+            original_modules[path] = module
+            if isinstance(module, nn.Linear):
+                logical_id = path_entries[0].logical_layer_id
+                wrapper = DualLoRALinear(
+                    module,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                    generator=_generator(module.weight.device, _stable_seed(global_seed, logical_id)),
+                    logical_id=logical_id,
                 )
-                for group_index in range(module.groups)
-            ]
-            wrapper = DualLoRAConv2d(
-                module,
-                rank=rank,
-                alpha=alpha,
-                dropout=dropout,
-                generators=generators,
-                logical_id=path,
-            )
-            _replace_child(parent, name, wrapper)
-            physical_modules[path] = wrapper
-            for group in wrapper.iter_logical_groups():
-                assert group.logical_id is not None
-                adapters[group.logical_id] = group
-        else:
-            raise RuntimeError(f"target changed type before injection: {path}")
-        injected_paths.add(path)
+                _replace_child(parent, name, wrapper)
+                adapters[logical_id] = wrapper
+                physical_modules[path] = wrapper
+            elif isinstance(module, nn.Conv2d):
+                generators = [
+                    _generator(
+                        module.weight.device,
+                        _stable_seed(global_seed, f"{path}::group={group_index}"),
+                    )
+                    for group_index in range(module.groups)
+                ]
+                wrapper = DualLoRAConv2d(
+                    module,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                    generators=generators,
+                    logical_id=path,
+                )
+                _replace_child(parent, name, wrapper)
+                physical_modules[path] = wrapper
+                for group in wrapper.iter_logical_groups():
+                    assert group.logical_id is not None
+                    adapters[group.logical_id] = group
+            else:
+                raise RuntimeError(f"target changed type before injection: {path}")
+            injected_paths.add(path)
 
-    injected_entries = tuple(
-        replace(entry, injected=entry.default_inject and entry.module_path in injected_paths)
-        for entry in manifest.entries
-    )
-    manifest = TargetManifest(
-        entries=injected_entries,
-        enabled=True,
-        metadata=dict(manifest.metadata),
-    )
-    expected_ids = {entry.logical_layer_id for entry in manifest.entries if entry.injected}
-    if expected_ids != set(adapters):
-        raise RuntimeError(
-            f"adapter registry/manifest mismatch: missing={sorted(expected_ids-set(adapters))}, "
-            f"extra={sorted(set(adapters)-expected_ids)}"
+        injected_entries = tuple(
+            replace(entry, injected=entry.default_inject and entry.module_path in injected_paths)
+            for entry in manifest.entries
         )
+        manifest = TargetManifest(
+            entries=injected_entries,
+            enabled=True,
+            metadata=dict(manifest.metadata),
+        )
+        expected_ids = {entry.logical_layer_id for entry in manifest.entries if entry.injected}
+        if expected_ids != set(adapters):
+            raise RuntimeError(
+                f"adapter registry/manifest mismatch: missing={sorted(expected_ids-set(adapters))}, "
+                f"extra={sorted(set(adapters)-expected_ids)}"
+            )
 
-    # Reassert frozen backbone and base BatchNorm eval immediately before each
-    # encoder forward, even if AdaJEPA calls encoder.train() for adapter updates.
-    hook = wm.encoder.register_forward_pre_hook(
-        lambda _module, _args: encoder_adapter.enforce_frozen_eval()
-    )
-    return InjectionResult(
-        adapters=adapters,
-        manifest=manifest,
-        encoder_adapter=encoder_adapter,
-        _physical_modules=physical_modules,
-        _base_eval_hook=hook,
-        _seed=global_seed,
-    )
+        # Reassert frozen backbone and base BatchNorm eval immediately before each
+        # encoder forward, even if AdaJEPA calls encoder.train() for adapter updates.
+        hook = wm.encoder.register_forward_pre_hook(
+            lambda _module, _args: encoder_adapter.enforce_frozen_eval()
+        )
+        return InjectionResult(
+            adapters=adapters,
+            manifest=manifest,
+            encoder_adapter=encoder_adapter,
+            _physical_modules=physical_modules,
+            _base_eval_hook=hook,
+            _seed=global_seed,
+            _original_modules=original_modules,
+            _original_parameter_requires_grad=original_parameter_requires_grad,
+            _original_training=original_training,
+            _had_encoder_protocol=had_encoder_protocol,
+            _previous_encoder_protocol=previous_encoder_protocol,
+        )
+    except Exception:
+        if hook is not None:
+            hook.remove()
+        for path, original in sorted(
+            original_modules.items(),
+            key=lambda item: item[0].count("."),
+            reverse=True,
+        ):
+            parent, name = _resolve_parent(wm, path)
+            _replace_child(parent, name, original)
+        if had_encoder_protocol:
+            setattr(wm, "_fd_psc_encoder_adapter", previous_encoder_protocol)
+        elif hasattr(wm, "_fd_psc_encoder_adapter"):
+            delattr(wm, "_fd_psc_encoder_adapter")
+        for parameter, required_grad in original_parameter_requires_grad:
+            parameter.requires_grad_(required_grad)
+        for module, was_training in original_training:
+            module.training = was_training
+        raise
 
 
 # Concise aliases for scripts written against early design drafts.

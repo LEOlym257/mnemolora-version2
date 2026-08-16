@@ -57,6 +57,9 @@ class SlowLoRAConfig:
     initial_rank: int = 8
     allowed_ranks: List[int] = field(default_factory=lambda: [8, 16, 24, 32])
     maximum_rank: int = 32
+    # V1 continues to select from ``allowed_ranks``.  FSD V2 instead requires
+    # one deterministic compression rank and validates that this field is set.
+    persistent_rank: Optional[int] = None
     spectral_energy_threshold: float = 0.99
     functional_error_threshold: float = 0.02
 
@@ -163,6 +166,81 @@ class ReplayConfig:
     maximum_context_clusters: int = 32
     new_cluster_similarity_threshold: float = 0.8
     minimum_windows_per_cluster: int = 4
+
+
+@dataclass
+class RTRCConfig:
+    enabled: bool = True
+    budget_fraction_initial: float = 0.20
+    budget_fraction_minimum: float = 0.02
+    budget_fraction_maximum: float = 1.00
+    geometry_windows: int = 128
+    geometry_maximum_rank: int = 64
+    geometry_energy_threshold: float = 0.999
+    minimum_energy: float = 1.0e-8
+    use_shared_dual: bool = True
+    layer_weight_mode: str = "relative_output_energy"
+    tail_mode: str = "conservative_isotropic"
+    bisection_iterations: int = 80
+    bisection_relative_tolerance: float = 1.0e-7
+    epsilon: float = 1.0e-8
+
+
+@dataclass
+class RawReplayConfig:
+    historical_windows: int = 512
+    store_model_input_obs: bool = True
+    store_frozen_visual_latent_cache: bool = False
+    image_storage_dtype: str = "uint8_or_source"
+    auxiliary_dtype: str = "float32"
+    maximum_context_clusters: int = 32
+    minimum_windows_per_cluster: int = 4
+
+
+@dataclass
+class AdaptiveBudgetConfig:
+    enabled: bool = True
+    controller_learning_rate: float = 0.25
+    plasticity_loss_target: float = 0.10
+    history_regression_target: float = 0.01
+    history_weight: float = 2.0
+    error_clip: float = 1.0
+    minimum_wake_gain: float = 1.0e-8
+
+
+@dataclass
+class CoreStorageConfig:
+    """Storage contract for the dense long-term core increment."""
+
+    mode: str = "dense_delta"
+
+
+@dataclass
+class DeepSleepConfig:
+    """Capacity-overflow consolidation and residual-rank recycling."""
+
+    # Phase 2 is a live part of the shipped FSD V2 algorithm.  The trigger is
+    # still capacity-driven, so enabling it does not make distillation run on
+    # every commit.
+    enabled: bool = True
+    trigger_relative_rank_error: float = 0.05
+    trigger_consecutive_commits: int = 3
+    minimum_replay_windows: int = 64
+    strategy: str = "residual_distill"
+    maximum_steps: int = 100
+    learning_rate: float = 1.0e-5
+    output_residual_weight: float = 1.0
+    hidden_residual_weight: float = 0.25
+    current_task_weight: float = 0.25
+    residual_rank: int = 8
+    batch_size: int = 8
+    hidden_layer_maximum: int = 4
+    validation_fraction: float = 0.20
+    minimum_validation_windows: int = 8
+    functional_error_threshold: float = 0.02
+    functional_error_absolute_tolerance: float = 1.0e-8
+    epsilon: float = 1.0e-8
+    core_storage: CoreStorageConfig = field(default_factory=CoreStorageConfig)
 
 
 @dataclass
@@ -294,6 +372,10 @@ _NESTED_TYPES = {
     "activation_subspace": ActivationSubspaceConfig,
     "merge": MergeConfig,
     "replay": ReplayConfig,
+    "rtrc": RTRCConfig,
+    "raw_replay": RawReplayConfig,
+    "adaptive_budget": AdaptiveBudgetConfig,
+    "deep_sleep": DeepSleepConfig,
     "external_eval_data": ExternalEvalDataConfig,
     "anchor_data": AnchorDataConfig,
     "repair": RepairConfig,
@@ -323,6 +405,12 @@ class FDPSCConfig:
     activation_subspace: ActivationSubspaceConfig = field(default_factory=ActivationSubspaceConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
+    rtrc: RTRCConfig = field(default_factory=RTRCConfig)
+    raw_replay: RawReplayConfig = field(default_factory=RawReplayConfig)
+    adaptive_budget: AdaptiveBudgetConfig = field(
+        default_factory=AdaptiveBudgetConfig
+    )
+    deep_sleep: DeepSleepConfig = field(default_factory=DeepSleepConfig)
     external_eval_data: ExternalEvalDataConfig = field(default_factory=ExternalEvalDataConfig)
     anchor_data: AnchorDataConfig = field(default_factory=AnchorDataConfig)
     repair: RepairConfig = field(default_factory=RepairConfig)
@@ -364,6 +452,24 @@ class FDPSCConfig:
                     kwargs[attr] = item
                 elif isinstance(item, Mapping) or hasattr(item, "items"):
                     item_dict = dict(item.items())
+                    if nested_type is DeepSleepConfig:
+                        core_storage = item_dict.get("core_storage")
+                        if isinstance(core_storage, Mapping) or hasattr(
+                            core_storage, "items"
+                        ):
+                            core_mapping = dict(core_storage.items())
+                            core_fields = {
+                                f.name for f in dataclasses.fields(CoreStorageConfig)
+                            }
+                            core_extra = sorted(set(core_mapping) - core_fields)
+                            if core_extra:
+                                raise FDPSCConfigError(
+                                    "unknown fd_psc.deep_sleep.core_storage fields: "
+                                    f"{core_extra}"
+                                )
+                            item_dict["core_storage"] = CoreStorageConfig(
+                                **core_mapping
+                            )
                     field_names = {f.name for f in dataclasses.fields(nested_type)}
                     extra = sorted(set(item_dict) - field_names)
                     if extra:
@@ -384,6 +490,44 @@ class FDPSCConfig:
         payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def v2_persistence_identity(self) -> Dict[str, Any]:
+        """Return only configuration that changes the FSD V2 algorithm.
+
+        External evaluation, legacy FD-PSC controls, reporting, and checkpoint
+        locations are deliberately absent.  In particular, attaching an
+        offline report manifest must never make an otherwise identical V2
+        sidecar incompatible with resume.
+        """
+
+        if self.run_mode != "fsd_v2":
+            raise FDPSCConfigError(
+                "v2_persistence_identity is only defined for run_mode=fsd_v2"
+            )
+        return {
+            "identity_schema_version": 2,
+            "algorithm_version": "fsd_v2",
+            "seed": self.seed,
+            "target_modules": asdict(self.target_modules),
+            "episodic_lora": asdict(self.episodic_lora),
+            "conv_lora": asdict(self.conv_lora),
+            "slow_lora": {
+                "persistent_rank": self.slow_lora.persistent_rank,
+            },
+            "rtrc": asdict(self.rtrc),
+            "raw_replay": asdict(self.raw_replay),
+            "adaptive_budget": asdict(self.adaptive_budget),
+            "deep_sleep": asdict(self.deep_sleep),
+        }
+
+    def v2_persistence_identity_hash(self) -> str:
+        payload = json.dumps(
+            self.v2_persistence_identity(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def persistence_identity_hash(self) -> str:
         """Algorithm identity used by sidecar resume validation.
 
@@ -394,10 +538,42 @@ class FDPSCConfig:
         documented resume workflow.
         """
 
+        if self.run_mode == "fsd_v2":
+            return self.v2_persistence_identity_hash()
+
         value = self.to_dict()
+        # These fields did not exist in the V1 schema and have no V1 runtime
+        # semantics.  Removing them preserves existing V1 sidecar identities.
+        value.pop("rtrc", None)
+        value.pop("raw_replay", None)
+        value.pop("adaptive_budget", None)
+        value.pop("deep_sleep", None)
+        value["slow_lora"].pop("persistent_rank", None)
         value["checkpoint"]["resume_path"] = None
         payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def resolve_v2_paths(self, runtime_output_dir: Path) -> Dict[str, Optional[Path]]:
+        """Resolve only FSD V2 sidecar paths.
+
+        Keeping this separate from :meth:`resolve_paths` makes it impossible
+        for V2 construction/validation to accidentally consume an external,
+        anchor, plasticity, or commit-query path.
+        """
+
+        root = Path(runtime_output_dir).expanduser().resolve()
+
+        def resolved(raw: Optional[str]) -> Optional[Path]:
+            if raw is None:
+                return None
+            path = Path(raw).expanduser()
+            return (path if path.is_absolute() else root / path).resolve()
+
+        return {
+            "state_directory": resolved(self.checkpoint.state_directory),
+            "latest_pointer": resolved(self.checkpoint.latest_pointer_path),
+            "resume": resolved(self.checkpoint.resume_path),
+        }
 
     def resolve_paths(self, runtime_output_dir: Path) -> Dict[str, Optional[Path]]:
         root = Path(runtime_output_dir).expanduser().resolve()
@@ -423,16 +599,437 @@ class FDPSCConfig:
             "resume": resolved(self.checkpoint.resume_path),
         }
 
+    def _validate_fsd_v2(
+        self,
+        *,
+        runtime_output_dir: Optional[Path],
+        require_files: bool,
+    ) -> None:
+        """Validate only controls consumed by the first FSD V2 path."""
+
+        def require_bool(name: str, value: Any) -> None:
+            if not isinstance(value, bool):
+                raise FDPSCConfigError(f"{name} must be boolean")
+
+        def positive_int(name: str, value: Any) -> None:
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise FDPSCConfigError(f"{name} must be a positive integer")
+
+        def finite(name: str, value: Any) -> float:
+            try:
+                result = float(value)
+            except (TypeError, ValueError) as exc:
+                raise FDPSCConfigError(f"{name} must be finite") from exc
+            if not math.isfinite(result):
+                raise FDPSCConfigError(f"{name} must be finite")
+            return result
+
+        def finite_positive(name: str, value: Any) -> float:
+            result = finite(name, value)
+            if result <= 0.0:
+                raise FDPSCConfigError(f"{name} must be finite and positive")
+            return result
+
+        # First-round FSD V2 has one explicit algorithm path.  Legacy
+        # correction/search/gating switches are not merely unused defaults:
+        # accepting them as enabled would falsely advertise behavior that the
+        # V2 runtime does not execute.
+        disabled_legacy_controls = (
+            ("gradient_geometry.enabled", self.gradient_geometry.enabled),
+            ("slice.enabled", self.slice.enabled),
+            ("sdc.enabled", self.sdc.enabled),
+            ("spectral_surgery.enabled", self.spectral_surgery.enabled),
+            ("activation_subspace.enabled", self.activation_subspace.enabled),
+            ("merge.soft_ness_enabled", self.merge.soft_ness_enabled),
+            ("repair.enabled", self.repair.enabled),
+            ("exception.enabled", self.exception.enabled),
+            ("gates.allow_unsafe_ablation", self.gates.allow_unsafe_ablation),
+            ("gates.current_gain_enabled", self.gates.current_gain_enabled),
+            ("gates.history_enabled", self.gates.history_enabled),
+            ("gates.anchor_enabled", self.gates.anchor_enabled),
+            ("gates.plasticity_enabled", self.gates.plasticity_enabled),
+            ("gates.functional_error_enabled", self.gates.functional_error_enabled),
+            ("gates.spectral_drift_enabled", self.gates.spectral_drift_enabled),
+            ("canary.enabled", self.canary.enabled),
+        )
+        for name, value in disabled_legacy_controls:
+            require_bool(name, value)
+            if value:
+                raise FDPSCConfigError(
+                    f"fsd_v2 first-round runtime requires {name}=false"
+                )
+
+        require_bool("fd_psc.enabled", self.enabled)
+        for name, value in (
+            ("target_modules.predictor_linear", self.target_modules.predictor_linear),
+            (
+                "target_modules.post_backbone_projection_linear",
+                self.target_modules.post_backbone_projection_linear,
+            ),
+            (
+                "target_modules.action_encoder_linear",
+                self.target_modules.action_encoder_linear,
+            ),
+            (
+                "target_modules.proprio_encoder_linear",
+                self.target_modules.proprio_encoder_linear,
+            ),
+            (
+                "target_modules.exclude_frozen_backbone",
+                self.target_modules.exclude_frozen_backbone,
+            ),
+            (
+                "target_modules.require_active_forward_path",
+                self.target_modules.require_active_forward_path,
+            ),
+            (
+                "target_modules.fail_on_empty_predictor_targets",
+                self.target_modules.fail_on_empty_predictor_targets,
+            ),
+            (
+                "target_modules.fail_on_empty_projection_targets",
+                self.target_modules.fail_on_empty_projection_targets,
+            ),
+            (
+                "target_modules.require_projection_targets_if_head_exists",
+                self.target_modules.require_projection_targets_if_head_exists,
+            ),
+        ):
+            require_bool(name, value)
+        if not self.target_modules.predictor_linear:
+            raise FDPSCConfigError(
+                "fsd_v2 currently requires target_modules.predictor_linear=true"
+            )
+        if not self.target_modules.exclude_frozen_backbone:
+            raise FDPSCConfigError(
+                "fsd_v2 first-round target discovery requires "
+                "target_modules.exclude_frozen_backbone=true"
+            )
+        if not self.target_modules.require_active_forward_path:
+            raise FDPSCConfigError(
+                "fsd_v2 requires target_modules.require_active_forward_path=true"
+            )
+        if not self.target_modules.fail_on_empty_predictor_targets:
+            raise FDPSCConfigError(
+                "fsd_v2 requires target_modules.fail_on_empty_predictor_targets=true"
+            )
+
+        positive_int("episodic_lora.rank", self.episodic_lora.rank)
+        finite_positive("episodic_lora.alpha", self.episodic_lora.alpha)
+        dropout = finite("episodic_lora.dropout", self.episodic_lora.dropout)
+        if dropout != 0.0:
+            raise FDPSCConfigError("fsd_v2 currently requires episodic_lora.dropout=0")
+        require_bool("episodic_lora.pilot_enabled", self.episodic_lora.pilot_enabled)
+        if not self.episodic_lora.pilot_enabled:
+            raise FDPSCConfigError("fsd_v2 requires episodic_lora.pilot_enabled=true")
+        if self.episodic_lora.a_initialization != "kaiming_uniform":
+            raise FDPSCConfigError(
+                "fsd_v2 requires episodic_lora.a_initialization=kaiming_uniform"
+            )
+        if self.episodic_lora.b_initialization != "zeros":
+            raise FDPSCConfigError(
+                "fsd_v2 requires episodic_lora.b_initialization=zeros"
+            )
+
+        require_bool("conv_lora.enabled", self.conv_lora.enabled)
+        if self.conv_lora.enabled and (
+            self.conv_lora.target_scope != "post_backbone_projection_head"
+            or self.conv_lora.parameterization != "flattened_kernel"
+            or self.conv_lora.groups_mode != "groupwise"
+        ):
+            raise FDPSCConfigError(
+                "fsd_v2 ConvLoRA currently requires "
+                "post_backbone_projection_head/flattened_kernel/groupwise semantics"
+            )
+
+        persistent_rank = self.slow_lora.persistent_rank
+        positive_int("slow_lora.persistent_rank", persistent_rank)
+        positive_int("slow_lora.maximum_rank", self.slow_lora.maximum_rank)
+        assert persistent_rank is not None
+        if persistent_rank > self.slow_lora.maximum_rank:
+            raise FDPSCConfigError(
+                "slow_lora.persistent_rank must not exceed slow_lora.maximum_rank"
+            )
+
+        require_bool("rtrc.enabled", self.rtrc.enabled)
+        if not self.rtrc.enabled:
+            raise FDPSCConfigError("fsd_v2 requires rtrc.enabled=true")
+        beta_minimum = finite_positive(
+            "rtrc.budget_fraction_minimum",
+            self.rtrc.budget_fraction_minimum,
+        )
+        beta_initial = finite_positive(
+            "rtrc.budget_fraction_initial",
+            self.rtrc.budget_fraction_initial,
+        )
+        beta_maximum = finite_positive(
+            "rtrc.budget_fraction_maximum",
+            self.rtrc.budget_fraction_maximum,
+        )
+        if not (beta_minimum <= beta_initial <= beta_maximum <= 1.0):
+            raise FDPSCConfigError(
+                "rtrc budget fractions must satisfy "
+                "0 < minimum <= initial <= maximum <= 1"
+            )
+        positive_int("rtrc.geometry_windows", self.rtrc.geometry_windows)
+        positive_int("rtrc.geometry_maximum_rank", self.rtrc.geometry_maximum_rank)
+        geometry_threshold = finite(
+            "rtrc.geometry_energy_threshold",
+            self.rtrc.geometry_energy_threshold,
+        )
+        if not 0.0 < geometry_threshold <= 1.0:
+            raise FDPSCConfigError(
+                "rtrc.geometry_energy_threshold must be in (0, 1]"
+            )
+        finite_positive("rtrc.minimum_energy", self.rtrc.minimum_energy)
+        require_bool("rtrc.use_shared_dual", self.rtrc.use_shared_dual)
+        if not self.rtrc.use_shared_dual:
+            raise FDPSCConfigError("fsd_v2 requires rtrc.use_shared_dual=true")
+        if self.rtrc.layer_weight_mode != "relative_output_energy":
+            raise FDPSCConfigError(
+                "fsd_v2 requires rtrc.layer_weight_mode=relative_output_energy"
+            )
+        if self.rtrc.tail_mode != "conservative_isotropic":
+            raise FDPSCConfigError(
+                "fsd_v2 requires rtrc.tail_mode=conservative_isotropic"
+            )
+        positive_int("rtrc.bisection_iterations", self.rtrc.bisection_iterations)
+        finite_positive(
+            "rtrc.bisection_relative_tolerance",
+            self.rtrc.bisection_relative_tolerance,
+        )
+        finite_positive("rtrc.epsilon", self.rtrc.epsilon)
+
+        positive_int(
+            "raw_replay.historical_windows",
+            self.raw_replay.historical_windows,
+        )
+        require_bool(
+            "raw_replay.store_model_input_obs",
+            self.raw_replay.store_model_input_obs,
+        )
+        if not self.raw_replay.store_model_input_obs:
+            raise FDPSCConfigError(
+                "fsd_v2 requires raw_replay.store_model_input_obs=true"
+            )
+        require_bool(
+            "raw_replay.store_frozen_visual_latent_cache",
+            self.raw_replay.store_frozen_visual_latent_cache,
+        )
+        if self.raw_replay.store_frozen_visual_latent_cache:
+            raise FDPSCConfigError(
+                "raw_replay.store_frozen_visual_latent_cache=true is not implemented"
+            )
+        if self.raw_replay.image_storage_dtype != "uint8_or_source":
+            raise FDPSCConfigError(
+                "raw_replay.image_storage_dtype must be uint8_or_source"
+            )
+        if self.raw_replay.auxiliary_dtype != "float32":
+            raise FDPSCConfigError("raw_replay.auxiliary_dtype must be float32")
+        positive_int(
+            "raw_replay.maximum_context_clusters",
+            self.raw_replay.maximum_context_clusters,
+        )
+        positive_int(
+            "raw_replay.minimum_windows_per_cluster",
+            self.raw_replay.minimum_windows_per_cluster,
+        )
+        if (
+            self.raw_replay.minimum_windows_per_cluster
+            > self.raw_replay.historical_windows
+        ):
+            raise FDPSCConfigError(
+                "raw_replay.minimum_windows_per_cluster must not exceed "
+                "raw_replay.historical_windows"
+            )
+
+        require_bool("adaptive_budget.enabled", self.adaptive_budget.enabled)
+        if not self.adaptive_budget.enabled:
+            raise FDPSCConfigError("fsd_v2 requires adaptive_budget.enabled=true")
+        finite_positive(
+            "adaptive_budget.controller_learning_rate",
+            self.adaptive_budget.controller_learning_rate,
+        )
+        for name, value in (
+            ("plasticity_loss_target", self.adaptive_budget.plasticity_loss_target),
+            (
+                "history_regression_target",
+                self.adaptive_budget.history_regression_target,
+            ),
+            ("history_weight", self.adaptive_budget.history_weight),
+            ("minimum_wake_gain", self.adaptive_budget.minimum_wake_gain),
+        ):
+            numeric = finite(f"adaptive_budget.{name}", value)
+            if numeric < 0.0:
+                raise FDPSCConfigError(
+                    f"adaptive_budget.{name} must be non-negative"
+                )
+        finite_positive("adaptive_budget.error_clip", self.adaptive_budget.error_clip)
+
+        require_bool("deep_sleep.enabled", self.deep_sleep.enabled)
+        trigger_error = finite(
+            "deep_sleep.trigger_relative_rank_error",
+            self.deep_sleep.trigger_relative_rank_error,
+        )
+        if trigger_error < 0.0:
+            raise FDPSCConfigError(
+                "deep_sleep.trigger_relative_rank_error must be non-negative"
+            )
+        positive_int(
+            "deep_sleep.trigger_consecutive_commits",
+            self.deep_sleep.trigger_consecutive_commits,
+        )
+        positive_int(
+            "deep_sleep.minimum_replay_windows",
+            self.deep_sleep.minimum_replay_windows,
+        )
+        if self.deep_sleep.strategy != "residual_distill":
+            raise FDPSCConfigError(
+                "deep_sleep.strategy must be residual_distill"
+            )
+        positive_int("deep_sleep.maximum_steps", self.deep_sleep.maximum_steps)
+        finite_positive("deep_sleep.learning_rate", self.deep_sleep.learning_rate)
+        weights = {}
+        for name, value in (
+            ("output_residual_weight", self.deep_sleep.output_residual_weight),
+            ("hidden_residual_weight", self.deep_sleep.hidden_residual_weight),
+            ("current_task_weight", self.deep_sleep.current_task_weight),
+        ):
+            numeric = finite(f"deep_sleep.{name}", value)
+            if numeric < 0.0:
+                raise FDPSCConfigError(
+                    f"deep_sleep.{name} must be non-negative"
+                )
+            weights[name] = numeric
+        if weights["output_residual_weight"] <= 0.0:
+            raise FDPSCConfigError(
+                "deep_sleep.output_residual_weight must be positive"
+            )
+        positive_int("deep_sleep.residual_rank", self.deep_sleep.residual_rank)
+        positive_int("deep_sleep.batch_size", self.deep_sleep.batch_size)
+        positive_int(
+            "deep_sleep.hidden_layer_maximum",
+            self.deep_sleep.hidden_layer_maximum,
+        )
+        validation_fraction = finite(
+            "deep_sleep.validation_fraction",
+            self.deep_sleep.validation_fraction,
+        )
+        if not 0.0 < validation_fraction < 1.0:
+            raise FDPSCConfigError(
+                "deep_sleep.validation_fraction must be in (0, 1)"
+            )
+        positive_int(
+            "deep_sleep.minimum_validation_windows",
+            self.deep_sleep.minimum_validation_windows,
+        )
+        functional_threshold = finite(
+            "deep_sleep.functional_error_threshold",
+            self.deep_sleep.functional_error_threshold,
+        )
+        if functional_threshold < 0.0:
+            raise FDPSCConfigError(
+                "deep_sleep.functional_error_threshold must be non-negative"
+            )
+        absolute_tolerance = finite(
+            "deep_sleep.functional_error_absolute_tolerance",
+            self.deep_sleep.functional_error_absolute_tolerance,
+        )
+        if absolute_tolerance < 0.0:
+            raise FDPSCConfigError(
+                "deep_sleep.functional_error_absolute_tolerance must be non-negative"
+            )
+        finite_positive("deep_sleep.epsilon", self.deep_sleep.epsilon)
+        if not isinstance(self.deep_sleep.core_storage, CoreStorageConfig):
+            raise FDPSCConfigError(
+                "deep_sleep.core_storage must be a typed mapping"
+            )
+        if self.deep_sleep.core_storage.mode != "dense_delta":
+            raise FDPSCConfigError(
+                "deep_sleep.core_storage.mode must be dense_delta"
+            )
+
+        require_bool("checkpoint.enabled", self.checkpoint.enabled)
+        require_bool(
+            "checkpoint.keep_commit_journal",
+            self.checkpoint.keep_commit_journal,
+        )
+        require_bool("checkpoint.atomic_write", self.checkpoint.atomic_write)
+        if not self.checkpoint.keep_commit_journal:
+            raise FDPSCConfigError(
+                "fsd_v2 requires checkpoint.keep_commit_journal=true"
+            )
+        if not self.checkpoint.atomic_write:
+            raise FDPSCConfigError("fsd_v2 requires checkpoint.atomic_write=true")
+        positive_int(
+            "checkpoint.save_every_episodes",
+            self.checkpoint.save_every_episodes,
+        )
+        positive_int(
+            "checkpoint.retention_versions",
+            self.checkpoint.retention_versions,
+        )
+        for name, value in (
+            ("checkpoint.state_directory", self.checkpoint.state_directory),
+            ("checkpoint.latest_pointer_path", self.checkpoint.latest_pointer_path),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise FDPSCConfigError(f"{name} must be a non-empty path string")
+        resume_value = self.checkpoint.resume_path
+        if resume_value is not None and (
+            not isinstance(resume_value, str) or not resume_value.strip()
+        ):
+            raise FDPSCConfigError(
+                "checkpoint.resume_path must be null or a non-empty path string"
+            )
+        if resume_value is not None and not self.checkpoint.enabled:
+            raise FDPSCConfigError(
+                "checkpoint.resume_path requires checkpoint.enabled=true"
+            )
+
+        runtime_root = Path.cwd() if runtime_output_dir is None else Path(runtime_output_dir)
+        paths = self.resolve_v2_paths(runtime_root)
+        state_directory = paths["state_directory"]
+        latest_pointer = paths["latest_pointer"]
+        resume_path = paths["resume"]
+        assert state_directory is not None and latest_pointer is not None
+        if resume_path is not None:
+            explicit_version = (
+                resume_path.parent == state_directory and resume_path.suffix == ".pt"
+            )
+            if resume_path != latest_pointer and not explicit_version:
+                raise FDPSCConfigError(
+                    "checkpoint.resume_path must be the configured latest pointer "
+                    "or a .pt version directly inside checkpoint.state_directory"
+                )
+            if require_files and not resume_path.is_file():
+                raise FDPSCConfigError(
+                    f"FSD V2 resume checkpoint is not readable: {resume_path}"
+                )
+
     def validate(self, runtime_output_dir: Optional[Path] = None, require_files: bool = True) -> None:
         if not isinstance(self.seed, int) or self.seed < 0:
             raise FDPSCConfigError("fd_psc.seed must be a non-negative integer")
         if not self.enabled:
             return
 
-        if self.run_mode not in {"fd_psc", "episodic_reset", "accumulate", "plain_svd"}:
+        if self.run_mode not in {
+            "fd_psc",
+            "fsd_v2",
+            "episodic_reset",
+            "accumulate",
+            "plain_svd",
+        }:
             raise FDPSCConfigError(
-                "fd_psc.run_mode must be fd_psc, episodic_reset, accumulate, or plain_svd"
+                "fd_psc.run_mode must be fd_psc, fsd_v2, episodic_reset, "
+                "accumulate, or plain_svd"
             )
+        if self.run_mode == "fsd_v2":
+            self._validate_fsd_v2(
+                runtime_output_dir=runtime_output_dir,
+                require_files=require_files,
+            )
+            return
         if self.gradient_geometry.projection_method not in {
             "dual_constraint",
             "c_pcgrad",
@@ -911,8 +1508,55 @@ def minimal_test_config(**overrides: Any) -> FDPSCConfig:
     return cfg
 
 
+def minimal_fsd_v2_config(**overrides: Any) -> FDPSCConfig:
+    """Return a dependency-light FSD V2 config with no external data inputs."""
+
+    raw: Dict[str, Any] = {
+        "enabled": True,
+        "run_mode": "fsd_v2",
+        "slow_lora": {"persistent_rank": 8},
+        "gradient_geometry": {"enabled": False},
+        "slice": {"enabled": False},
+        "sdc": {"enabled": False},
+        "spectral_surgery": {"enabled": False},
+        "activation_subspace": {"enabled": False},
+        "merge": {"soft_ness_enabled": False},
+        "repair": {"enabled": False},
+        "exception": {
+            "enabled": False,
+            "maximum_adapters": 0,
+            "local_replay_windows": 0,
+        },
+        "gates": {
+            "allow_unsafe_ablation": False,
+            "current_gain_enabled": False,
+            "history_enabled": False,
+            "anchor_enabled": False,
+            "plasticity_enabled": False,
+            "functional_error_enabled": False,
+            "spectral_drift_enabled": False,
+        },
+        "canary": {"enabled": False},
+        "checkpoint": {"enabled": False},
+    }
+    for key, value in overrides.items():
+        if isinstance(value, Mapping) and isinstance(raw.get(key), Mapping):
+            raw[key] = {**raw[key], **value}
+        else:
+            raw[key] = value
+    cfg = FDPSCConfig.from_mapping(raw)
+    cfg.validate(require_files=False)
+    return cfg
+
+
 __all__ = [
+    "AdaptiveBudgetConfig",
+    "CoreStorageConfig",
+    "DeepSleepConfig",
     "FDPSCConfig",
     "FDPSCConfigError",
+    "RTRCConfig",
+    "RawReplayConfig",
+    "minimal_fsd_v2_config",
     "minimal_test_config",
 ]

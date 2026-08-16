@@ -4,16 +4,135 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
 
 class ReplayError(RuntimeError):
     pass
+
+
+def deep_cpu_clone(value: Any) -> Any:
+    """Detach and clone every tensor in a nested model-input payload on CPU.
+
+    Raw replay owns its copy of the pre-encoder model inputs.  The helper is
+    intentionally structural and does not coerce tensor dtypes: in particular,
+    uint8 image inputs remain uint8 and already-normalized floating inputs keep
+    their exact representation.
+    """
+
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, Mapping):
+        return {copy.deepcopy(key): deep_cpu_clone(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(deep_cpu_clone(item) for item in value)
+    if isinstance(value, list):
+        return [deep_cpu_clone(item) for item in value]
+    if isinstance(value, set):
+        return {deep_cpu_clone(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(deep_cpu_clone(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _raw_json_value(value: Any, *, path: str) -> Any:
+    """Return the canonical JSON view used by online support identity hashes."""
+
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu().contiguous()
+        if tensor.is_complex():
+            raise ReplayError(f"{path} cannot contain complex tensors")
+        if not torch.isfinite(tensor).all():
+            raise ReplayError(f"{path} must contain only finite tensors")
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        return {
+            "__raw_kind__": "torch_tensor",
+            "dtype": str(tensor.dtype),
+            "shape": [int(item) for item in tensor.shape],
+            "bytes_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    if isinstance(value, Mapping):
+        result = []
+        seen_keys: set[str] = set()
+        for key in sorted(value, key=str):
+            stable_key = str(key)
+            if stable_key in seen_keys:
+                raise ReplayError(f"{path} has colliding stringified mapping keys")
+            seen_keys.add(stable_key)
+            result.append(
+                [
+                    stable_key,
+                    _raw_json_value(value[key], path=f"{path}.{stable_key}"),
+                ]
+            )
+        return {"__raw_kind__": "mapping", "items": result}
+    if isinstance(value, (list, tuple)):
+        return {
+            "__raw_kind__": "tuple" if isinstance(value, tuple) else "list",
+            "items": [
+                _raw_json_value(item, path=f"{path}[{index}]")
+                for index, item in enumerate(value)
+            ],
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ReplayError(f"{path} must contain only finite values")
+        return value
+    # NumPy arrays and similar source-input containers can preserve their
+    # exact dtype/shape/bytes without making NumPy a module dependency.
+    tobytes = getattr(value, "tobytes", None)
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if callable(tobytes) and shape is not None and dtype is not None:
+        raw = tobytes(order="C")
+        return {
+            "__raw_kind__": "array",
+            "dtype": str(dtype),
+            "shape": [int(item) for item in shape],
+            "bytes_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    # Scalars and other JSON-compatible source containers expose ``tolist``.
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return _raw_json_value(tolist(), path=path)
+    raise ReplayError(
+        f"{path} contains unsupported raw replay value {type(value).__name__}"
+    )
+
+
+def _raw_content_hash(obs: Mapping[str, Any], actions: Any) -> str:
+    canonical = _raw_json_value({"obs": obs, "actions": actions}, path="raw_replay")
+    try:
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:  # defensive; _raw_json_value is strict
+        raise ReplayError(f"raw replay payload is not canonical JSON: {exc}") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _assert_cpu_tensor_tree(value: Any, *, path: str) -> None:
+    if torch.is_tensor(value):
+        if value.device.type != "cpu":
+            raise ReplayError(f"{path} must be stored on CPU")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _assert_cpu_tensor_tree(item, path=f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _assert_cpu_tensor_tree(item, path=f"{path}[{index}]")
 
 
 def _derived_seed(seed: int, stable_id: str) -> int:
@@ -174,6 +293,258 @@ class ReplayWindow:
         if self.dynamics_change_available and bool(torch.as_tensor(self.dynamics_change).any()):
             value += 1.0
         return value
+
+
+@dataclass
+class RawReplayWindow:
+    """Version-2 replay window whose truth is the pre-encoder model input.
+
+    ``optional_latent_cache`` is deliberately excluded from identity and from
+    :meth:`to_model_payload`.  A caller may use it only through
+    :meth:`latent_cache_for_model_version`, which makes model-version
+    invalidation explicit.
+    """
+
+    SCHEMA_VERSION: ClassVar[int] = 2
+
+    window_id: str
+    trajectory_id: str
+    transition_ids: Tuple[str, ...]
+    frame_ids: Tuple[str, ...]
+    timesteps: Tuple[int, ...]
+    content_hash: str
+    context_identifier: str
+    obs: Mapping[str, Any]
+    actions: Any
+
+    context_embedding: Any = None
+    time_positions: Any = None
+    prediction_mask: Any = None
+    source_episode: str = ""
+    preprocess_hash: str = ""
+    base_checkpoint_hash: str = ""
+    optional_latent_cache: Any = None
+    optional_latent_cache_model_version: int = -1
+    provenance: str = "episode_support"
+    committed: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    frozen_context_cluster_id: str = ""
+    frozen_context_cluster_prototype: Any = None
+    frozen_context_cluster_distance: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.window_id = str(self.window_id)
+        self.trajectory_id = str(self.trajectory_id)
+        self.transition_ids = tuple(str(item) for item in self.transition_ids)
+        self.frame_ids = tuple(str(item) for item in self.frame_ids)
+        self.timesteps = tuple(int(item) for item in self.timesteps)
+        self.content_hash = str(self.content_hash).lower()
+        self.context_identifier = str(self.context_identifier)
+        self.source_episode = str(self.source_episode)
+        self.preprocess_hash = str(self.preprocess_hash).lower()
+        self.base_checkpoint_hash = str(self.base_checkpoint_hash).lower()
+        self.provenance = str(self.provenance)
+        self.committed = bool(self.committed)
+        self.obs = deep_cpu_clone(self.obs)
+        self.actions = deep_cpu_clone(self.actions)
+        self.time_positions = deep_cpu_clone(self.time_positions)
+        self.prediction_mask = deep_cpu_clone(self.prediction_mask)
+        self.optional_latent_cache = deep_cpu_clone(self.optional_latent_cache)
+        self.optional_latent_cache_model_version = int(
+            self.optional_latent_cache_model_version
+        )
+        self.metadata = deep_cpu_clone(dict(self.metadata))
+        if self.context_embedding is not None:
+            self.context_embedding = _as_unit_vector(
+                self.context_embedding,
+                name="context_embedding",
+            )
+        self.frozen_context_cluster_id = str(self.frozen_context_cluster_id)
+        if self.frozen_context_cluster_prototype is not None:
+            prototype = _as_unit_vector(
+                self.frozen_context_cluster_prototype,
+                name="frozen context cluster prototype",
+            )
+            if not self.frozen_context_cluster_id:
+                raise ReplayError("a frozen cluster prototype requires a stable cluster id")
+            if self.context_embedding is None:
+                raise ReplayError("a frozen cluster prototype requires a context embedding")
+            distance = _cosine_distance(
+                self.context_embedding,
+                prototype,
+                name="frozen context cluster prototype",
+            )
+            if self.frozen_context_cluster_distance is not None and not math.isclose(
+                float(self.frozen_context_cluster_distance),
+                distance,
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-6,
+            ):
+                raise ReplayError(
+                    "frozen context cluster distance does not match its prototype"
+                )
+            self.frozen_context_cluster_prototype = prototype
+            self.frozen_context_cluster_distance = distance
+        elif self.frozen_context_cluster_distance is not None:
+            raise ReplayError("a frozen cluster distance requires its frozen prototype")
+        self.validate()
+
+    @staticmethod
+    def compute_content_hash(obs: Mapping[str, Any], actions: Any) -> str:
+        if not isinstance(obs, Mapping):
+            raise ReplayError("raw replay obs must be a mapping")
+        return _raw_content_hash(obs, actions)
+
+    def validate(self, *, require_context_embedding: bool = False) -> None:
+        """Re-audit a live or deserialized raw window without trusting pickle."""
+
+        if not self.window_id or not self.trajectory_id or not self.context_identifier:
+            raise ReplayError(
+                "window_id, trajectory_id, and context_identifier must be non-empty"
+            )
+        if not self.transition_ids or not self.frame_ids or not self.timesteps:
+            raise ReplayError(
+                "a raw replay window requires transition, frame, and timestep identities"
+            )
+        if len(set(self.transition_ids)) != len(self.transition_ids):
+            raise ReplayError("transition_ids must be unique within a raw replay window")
+        if len(set(self.frame_ids)) != len(self.frame_ids):
+            raise ReplayError("frame_ids must be unique within a raw replay window")
+        if len(self.frame_ids) != len(self.timesteps):
+            raise ReplayError("frame_ids and timesteps must describe the same raw frames")
+        if len(self.transition_ids) != max(0, len(self.timesteps) - 1):
+            raise ReplayError(
+                "a continuous raw window requires one transition between adjacent frames"
+            )
+        if any(b != a + 1 for a, b in zip(self.timesteps, self.timesteps[1:])):
+            raise ReplayError("raw replay timesteps must be contiguous")
+        if len(self.content_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in self.content_hash
+        ):
+            raise ReplayError("content_hash must be a lowercase SHA-256 hex digest")
+        for name, digest in (
+            ("preprocess_hash", self.preprocess_hash),
+            ("base_checkpoint_hash", self.base_checkpoint_hash),
+        ):
+            if digest and (
+                len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise ReplayError(f"{name} must be empty or a lowercase SHA-256 digest")
+        if not isinstance(self.obs, Mapping) or not self.obs:
+            raise ReplayError("raw replay obs must be a non-empty mapping")
+        if self.actions is None:
+            raise ReplayError("raw replay actions are required")
+        _assert_cpu_tensor_tree(self.obs, path="obs")
+        _assert_cpu_tensor_tree(self.actions, path="actions")
+        actual_hash = self.compute_content_hash(self.obs, self.actions)
+        if actual_hash != self.content_hash:
+            raise ReplayError(
+                "raw replay obs/actions no longer match the audited content_hash"
+            )
+        if torch.is_tensor(self.actions) and self.actions.ndim >= 2:
+            if int(self.actions.shape[1]) != len(self.transition_ids):
+                raise ReplayError(
+                    "raw replay action time dimension differs from transition identities"
+                )
+            for key, value in self.obs.items():
+                if not torch.is_tensor(value) or value.ndim < 2:
+                    continue
+                if int(value.shape[0]) != int(self.actions.shape[0]):
+                    raise ReplayError(
+                        f"raw replay observation {key!r} batch differs from actions"
+                    )
+                if int(value.shape[1]) != len(self.frame_ids):
+                    raise ReplayError(
+                        f"raw replay observation {key!r} must contain actions+1 frames"
+                    )
+        if require_context_embedding and self.context_embedding is None:
+            raise ReplayError("raw replay admission requires a context_embedding")
+        if self.context_embedding is not None:
+            context = _as_unit_vector(self.context_embedding, name="context_embedding")
+            stored_context = torch.as_tensor(
+                self.context_embedding,
+                dtype=torch.float32,
+            ).detach().cpu().flatten()
+            if not torch.allclose(
+                context,
+                stored_context,
+                atol=1.0e-6,
+                rtol=1.0e-6,
+            ):
+                raise ReplayError("stored context_embedding is not a unit vector")
+        if self.optional_latent_cache is None:
+            if self.optional_latent_cache_model_version != -1:
+                raise ReplayError(
+                    "a missing optional latent cache must use model version -1"
+                )
+        elif self.optional_latent_cache_model_version < 0:
+            raise ReplayError(
+                "an optional latent cache requires a non-negative model version"
+            )
+        if self.frozen_context_cluster_prototype is not None:
+            if not self.frozen_context_cluster_id or self.context_embedding is None:
+                raise ReplayError("invalid frozen raw replay cluster annotation")
+            prototype = _as_unit_vector(
+                self.frozen_context_cluster_prototype,
+                name="frozen context cluster prototype",
+            )
+            distance = _cosine_distance(
+                self.context_embedding,
+                prototype,
+                name="frozen context cluster prototype",
+            )
+            if self.frozen_context_cluster_distance is None or not math.isclose(
+                float(self.frozen_context_cluster_distance),
+                distance,
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-6,
+            ):
+                raise ReplayError("invalid frozen raw replay cluster distance")
+        elif self.frozen_context_cluster_distance is not None:
+            raise ReplayError("a frozen raw replay distance requires its prototype")
+
+    def clone(self) -> "RawReplayWindow":
+        return copy.deepcopy(self)
+
+    def to_model_payload(self) -> Dict[str, Any]:
+        """Return only the raw truth needed to execute the current model."""
+
+        self.validate()
+        return {
+            "obs": deep_cpu_clone(self.obs),
+            "actions": deep_cpu_clone(self.actions),
+        }
+
+    def latent_cache_for_model_version(self, model_version: int) -> Any:
+        if (
+            self.optional_latent_cache is None
+            or int(model_version) != self.optional_latent_cache_model_version
+        ):
+            return None
+        return deep_cpu_clone(self.optional_latent_cache)
+
+    def with_frozen_context_cluster(
+        self,
+        cluster_id: str,
+        prototype: Any,
+    ) -> "RawReplayWindow":
+        stable_cluster_id = str(cluster_id)
+        if not stable_cluster_id:
+            raise ReplayError("frozen context cluster id must be non-empty")
+        if self.context_embedding is None:
+            raise ReplayError("raw replay clustering requires a context_embedding")
+        center = _as_unit_vector(prototype, name="frozen context cluster prototype")
+        result = self.clone()
+        result.frozen_context_cluster_id = stable_cluster_id
+        result.frozen_context_cluster_prototype = center.clone()
+        result.frozen_context_cluster_distance = _cosine_distance(
+            result.context_embedding,
+            center,
+            name="frozen context cluster prototype",
+        )
+        result.validate(require_context_embedding=True)
+        return result
 
 
 @dataclass
@@ -445,6 +816,90 @@ class ClusterBalancedReplay:
             raise ReplayError("restored replay exceeds configured capacity")
 
 
+class RawReplayMemory(ClusterBalancedReplay):
+    """Schema-2 cluster-balanced reservoir containing only raw replay truth."""
+
+    SCHEMA_VERSION = 2
+    WINDOW_SCHEMA_VERSION = RawReplayWindow.SCHEMA_VERSION
+
+    def add_committed_window(
+        self,
+        window: RawReplayWindow,
+        *,
+        commit_kind: str,
+    ) -> ReplayAdmission:
+        if not isinstance(window, RawReplayWindow):
+            raise ReplayError("raw replay memory accepts only RawReplayWindow values")
+        window.validate(require_context_embedding=True)
+        return super().add_committed_window(window, commit_kind=commit_kind)
+
+    def add_committed_windows(
+        self,
+        windows: Iterable[RawReplayWindow],
+        *,
+        commit_kind: str,
+    ) -> List[ReplayAdmission]:
+        return [
+            self.add_committed_window(window, commit_kind=commit_kind)
+            for window in windows
+        ]
+
+    def state_dict(self) -> Dict[str, Any]:
+        for cluster in self._clusters.values():
+            for window in cluster.windows:
+                if not isinstance(window, RawReplayWindow):
+                    raise ReplayError("raw replay reservoir contains a non-raw window")
+                window.validate(require_context_embedding=True)
+        state = super().state_dict()
+        state["window_schema_version"] = self.WINDOW_SCHEMA_VERSION
+        state["truth_representation"] = "obs_actions"
+        return state
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if int(state.get("schema_version", -1)) != self.SCHEMA_VERSION:
+            raise ReplayError("unsupported raw replay schema")
+        if int(state.get("window_schema_version", -1)) != self.WINDOW_SCHEMA_VERSION:
+            raise ReplayError("unsupported raw replay window schema")
+        if state.get("truth_representation") != "obs_actions":
+            raise ReplayError("raw replay truth representation must be obs_actions")
+
+        # Restore into an isolated candidate so a corrupt checkpoint cannot
+        # partially mutate the live reservoir or its RNG streams.
+        candidate = RawReplayMemory(
+            self.capacity,
+            maximum_context_clusters=self.maximum_context_clusters,
+            new_cluster_similarity_threshold=self.new_cluster_similarity_threshold,
+            minimum_windows_per_cluster=self.minimum_windows_per_cluster,
+            seed=self.seed,
+        )
+        ClusterBalancedReplay.load_state_dict(candidate, state)
+
+        stored_ids: set[str] = set()
+        for cluster_id, cluster in sorted(candidate._clusters.items()):
+            if cluster.cluster_id != cluster_id:
+                raise ReplayError("raw replay cluster id changed during restore")
+            for window in cluster.windows:
+                if not isinstance(window, RawReplayWindow):
+                    raise ReplayError(
+                        "raw replay checkpoint contains a legacy or unknown window type"
+                    )
+                window.validate(require_context_embedding=True)
+                if not window.committed or window.provenance != "episode_support":
+                    raise ReplayError(
+                        "raw replay checkpoint contains an uncommitted/non-support window"
+                    )
+                if window.window_id in stored_ids:
+                    raise ReplayError("raw replay checkpoint contains duplicate window ids")
+                stored_ids.add(window.window_id)
+        if not stored_ids.issubset(candidate._seen_window_ids):
+            raise ReplayError("raw replay checkpoint omitted stored ids from its seen ledger")
+
+        self._clusters = candidate._clusters
+        self._next_cluster_index = candidate._next_cluster_index
+        self._seen_window_ids = candidate._seen_window_ids
+        self._sample_rng = candidate._sample_rng
+
+
 @dataclass(frozen=True)
 class GRASPBatch:
     phase: str
@@ -680,7 +1135,10 @@ __all__ = [
     "GRASPBatch",
     "GRASPSampler",
     "GRASPWindowScore",
+    "RawReplayMemory",
+    "RawReplayWindow",
     "ReplayAdmission",
     "ReplayError",
     "ReplayWindow",
+    "deep_cpu_clone",
 ]
